@@ -1338,6 +1338,16 @@ ACTIVE_R = "#F87171"
 FONT = "Segoe UI" if IS_WINDOWS else "DejaVu Sans"
 MONO = "Consolas" if IS_WINDOWS else "DejaVu Sans Mono"
 
+# The glass look (Windows 11): the window and the cards become see-through, so Windows' acrylic backdrop shows
+# through them. It is a setting, and it takes effect when the app starts.
+GLASS_KEY = "#010203"  # the colour Tk makes see-through; no part of the app uses it
+GLASS_AVAILABLE = IS_WINDOWS and sys.getwindowsversion().build >= 22621  # Windows 11 22H2 and later
+GLASS = GLASS_AVAILABLE and bool(load_settings().get("glass", False))
+if GLASS:
+    BG = GLASS_KEY
+    SURFACE = GLASS_KEY
+    SURFACE_2 = GLASS_KEY
+
 
 def _mix(a: str, b: str, t: float) -> str:
     """Blends colour a towards colour b by t, from 0 to 1."""
@@ -1386,7 +1396,10 @@ class Card(tk.Canvas):
         if int(self.cget("height")) != h:
             self.configure(height=h)
         self.delete("bg")
-        rounded_rect(self, 0, 0, w, h, self.radius, fill=self.fill, outline="", tags="bg")
+        if GLASS:
+            rounded_rect(self, 1, 1, w - 1, h - 1, self.radius, fill=self.fill, outline="#8D8799", width=1.5, tags="bg")
+        else:
+            rounded_rect(self, 0, 0, w, h, self.radius, fill=self.fill, outline="", tags="bg")
         self.tag_lower("bg")
 
 
@@ -2100,7 +2113,7 @@ def install_vigembus_driver(log, progress) -> bool:
 
 # --- Update check: asks GitHub for the newest release ---------------------------
 
-APP_VERSION = "0.2.11"
+APP_VERSION = "0.2.13"
 UPDATE_API = "https://api.github.com/repos/lexluther1307-sudo/Joy-con-2-Studio/releases/latest"
 RELEASES_PAGE = "https://github.com/lexluther1307-sudo/Joy-con-2-Studio/releases/latest"
 
@@ -2277,6 +2290,26 @@ class TrayIcon:
             self._shell32.Shell_NotifyIconW(NIM_DELETE, ctypes.byref(self._data))
 
 
+def apply_glass(window) -> bool:
+    """Windows 11 acrylic behind the window, with GLASS_KEY made see-through. False if Windows refuses it."""
+    try:
+        hwnd = ctypes.windll.user32.GetParent(window.winfo_id())
+
+        class Margins(ctypes.Structure):
+            _fields_ = [("left", ctypes.c_int), ("right", ctypes.c_int), ("top", ctypes.c_int), ("bottom", ctypes.c_int)]
+
+        dwm = ctypes.windll.dwmapi
+        if dwm.DwmExtendFrameIntoClientArea(hwnd, ctypes.byref(Margins(-1, -1, -1, -1))) != 0:
+            return False
+        acrylic = ctypes.c_int(3)  # DWMWA_SYSTEM_BACKDROP_TYPE (38): 3 = acrylic
+        if dwm.DwmSetWindowAttribute(hwnd, 38, ctypes.byref(acrylic), ctypes.sizeof(acrylic)) != 0:
+            return False
+        window.wm_attributes("-transparentcolor", GLASS_KEY)
+        return True
+    except (OSError, AttributeError, tk.TclError):
+        return False
+
+
 def start_show_server(on_show) -> bool:
     """Lets a second copy of the app show this window instead of starting another copy."""
     try:
@@ -2322,6 +2355,8 @@ class JoyCon2App(tk.Tk):
         self.geometry("1080x740")
         self.minsize(1000, 700)
         self.configure(bg=BG)
+        if GLASS and not apply_glass(self):
+            self.configure(bg="#141218")  # Windows refused the backdrop: the window keeps a solid background
 
         self.status_var = tk.StringVar(value="Hold SYNC on one or two Joy-Cons, then click Scan.")
         self.manager = JoyCon2Manager(self._set_status)
@@ -2432,7 +2467,10 @@ class JoyCon2App(tk.Tk):
         self._refresh_virtual_pill()
 
     def _start_update_check(self, manual: bool):
-        # Runs at startup (quiet unless a newer release exists) and from the Check for updates button
+        # Runs at startup (quiet unless a newer release exists) and from the Check for updates button.
+        # The setting "check_updates" switches the check at startup off; the button still checks.
+        if not manual and not load_settings().get("check_updates", True):
+            return
         def worker():
             try:
                 newer, latest, url = check_for_update()
@@ -2524,7 +2562,8 @@ class JoyCon2App(tk.Tk):
         row = tk.Frame(parent, bg=SURFACE)
         row.pack(fill="x", pady=(8, 0))
         M3Switch(row, var, command=command, bg=SURFACE).pack(side="left")
-        tk.Label(row, text=text, font=(FONT, 10), fg=TEXT, bg=SURFACE).pack(side="left", padx=(12, 0))
+        tk.Label(row, text=text, font=(FONT, 10), fg=TEXT, bg=SURFACE, anchor="w", justify="left",
+                 wraplength=330).pack(side="left", padx=(12, 0))
         return row
 
     def _build_deck_page(self):
@@ -2656,6 +2695,17 @@ class JoyCon2App(tk.Tk):
             M3Segmented(ob2, list(OUTPUT_LABELS.values()), self.output_var, command=self._set_output,
                         width=400, bg=SURFACE).pack(anchor="w")
 
+        if GLASS_AVAILABLE:
+            look = Card(right, bg=BG, fill=SURFACE)
+            look.pack(fill="x", pady=(14, 0))
+            lb = look.body
+            tk.Label(lb, text="Look", font=(FONT, 12, "bold"), fg=TEXT, bg=SURFACE).pack(anchor="w")
+            self.glass_var = tk.BooleanVar(value=load_settings().get("glass", False))
+            self._switch_row(lb, "Glass look (Windows 11)", self.glass_var, self._toggle_glass)
+            tk.Label(lb, text="The window and the cards become see-through, with Windows' acrylic behind them. "
+                              "Takes effect after you restart the app.",
+                     font=(FONT, 8), fg=MUTED, bg=SURFACE, justify="left", wraplength=400).pack(anchor="w", pady=(4, 0))
+
         sound = Card(right, bg=BG, fill=SURFACE)
         sound.pack(fill="x", pady=(14, 0))
         sb = sound.body
@@ -2682,6 +2732,9 @@ class JoyCon2App(tk.Tk):
         self.update_btn = M3Button(ab, "Check for updates", lambda: self._start_update_check(manual=True),
                                    style="outlined", bg=SURFACE)
         self.update_btn.pack(anchor="w")
+        self.check_updates_var = tk.BooleanVar(value=load_settings().get("check_updates", True))
+        self._switch_row(ab, "Check for updates when the app starts", self.check_updates_var,
+                         self._toggle_check_updates)
         if IS_WINDOWS:
             about_text = ("Closing the window keeps the app running in the notification area. "
                           "Right-click its icon to quit.")
@@ -2702,6 +2755,17 @@ class JoyCon2App(tk.Tk):
             self.manager.release_mouse()
         self.manager.set_active_choice(self.manager.active_choice)  # re-checks which Joy-Con is in use
         self.manager._sync_virtual_gamepad()
+
+    def _toggle_check_updates(self):
+        settings = load_settings()
+        settings["check_updates"] = self.check_updates_var.get()
+        save_settings(settings)
+
+    def _toggle_glass(self):
+        settings = load_settings()
+        settings["glass"] = self.glass_var.get()
+        save_settings(settings)
+        self._set_status("The glass look takes effect after you restart the app.")
 
     def _toggle_auto_mode(self):
         self.manager.set_auto_mode(self.auto_mode_var.get())

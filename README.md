@@ -38,6 +38,14 @@ Steam Deck plugin (`decky/joycon2studio`):
 - Sends Steam's rumble back to the PC. Shows a pairing code, has Connect and Disconnect buttons, and a Scan network button.
 - Updates itself from the project's latest GitHub release. See [its README](decky/joycon2studio/README.md#updates).
 
+## Setup program (Windows)
+
+`JoyCon2Studio-Setup-<version>.exe` installs what you need in one go: the Windows app with its shortcuts and its entry in Settings > Apps, the virtual controller driver (ViGEmBus) when it is missing, and, if you choose them, the Steam Deck plugin files and the Linux files. It asks before it does anything on the Steam Deck: a console opens there, and you type the Deck's passwords in it.
+
+- Automatic updates are off by default. The app's Settings page has a switch to check for updates when it starts, and the setup has the same switch.
+- Scripted install: `JoyCon2Studio-Setup-<version>.exe --silent --dir "C:\Path\To\Folder"`. Options are listed with `--help`.
+- Remove it: Settings > Apps, or `JoyCon2Studio-Setup-<version>.exe --uninstall`.
+
 ## Requirements
 
 Windows:

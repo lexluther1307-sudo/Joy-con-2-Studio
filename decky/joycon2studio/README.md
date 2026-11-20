@@ -19,7 +19,7 @@ The plugin updates itself from the project's latest GitHub release.
 - A newer release is installed only when no PC is connected, because the update restarts the plugin. While a PC is connected, the update waits.
 - Before anything is replaced, the download is checked against `SHA256SUMS.txt` from the same release. The new files must compile and must declare the release's version.
 - The previous version is kept in `~/homebrew/settings/joycon2studio/update/backup`. Then plugin_loader is restarted, so the new code runs.
-- Turn automatic updates off with the button in the Updates section. **Check for updates now** still installs a newer release.
+- Turn automatic updates off with the button in the Updates section. **Check for updates now** still installs a newer release. The setting is read when the plugin starts and saved when it changes, so switch it in the plugin rather than by editing the file.
 
 The first version with updates has to be installed by hand (step 3 above). Later updates happen by themselves. The checksum shows that a download is complete and matches the release; it does not protect against a release that someone changed on purpose.
 
