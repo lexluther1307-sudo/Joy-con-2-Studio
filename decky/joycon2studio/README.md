@@ -8,8 +8,8 @@ Status: the network bridge (below) was tested on a Deck. Direct Joy-Con pairing 
 ## Install on the Steam Deck
 
 1. Install Decky Loader first.
-2. Copy this folder to `~/homebrew/plugins/` (the folder must be named `joycon2studio`).
-3. Reboot the Deck.
+2. Put this folder on the Deck, or unzip the release zip (it contains a `joycon2studio` folder).
+3. In Konsole (Desktop Mode), go into that folder and run `bash install.sh`. It asks for your sudo password, installs the plugin to `~/homebrew/plugins/joycon2studio` and restarts the plugin loader.
 4. Open the Quick Access menu, pick Joy-Con 2 Studio.
 
 ## Test (direct Joy-Con connection)

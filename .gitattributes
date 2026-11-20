@@ -1,0 +1,2 @@
+# Shell scripts need LF line endings to run on Linux (the Steam Deck).
+*.sh text eol=lf

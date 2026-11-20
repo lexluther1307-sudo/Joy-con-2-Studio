@@ -59,8 +59,8 @@ The exe is written to `dist\JoyCon2Studio.exe`.
 ### Install the plugin
 
 1. Install Decky Loader on the Deck.
-2. Copy the `decky/joycon2studio` folder to `~/homebrew/plugins/joycon2studio` on the Deck. Decky installs plugins as root, so do the copy with `sudo` in Konsole (Desktop Mode).
-3. Restart the plugin loader with `sudo systemctl restart plugin_loader`, or reboot the Deck.
+2. Copy the `decky/joycon2studio` folder to the Deck, or unzip `joycon2studio-plugin.zip` from the release.
+3. In Konsole (Desktop Mode), go into that folder and run `bash install.sh`. It asks for your sudo password, installs the plugin to `~/homebrew/plugins/joycon2studio` and restarts the plugin loader. An older version is moved to `~/joycon2studio-backup-<date>`.
 4. Open the Quick Access menu and pick Joy-Con 2 Studio.
 
 ### Network bridge (Joy-Cons stay on the PC)
