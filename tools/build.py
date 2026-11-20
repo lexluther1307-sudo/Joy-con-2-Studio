@@ -39,6 +39,7 @@ SOURCES = [
     ROOT / "linux_mouse.py",
     ROOT / "installer" / "joycon2studio_setup.py",
     ROOT / "installer" / "linux" / "install-linux.sh",
+    ROOT / "tools" / "build_linux.py",
     ROOT / "packaging" / "linux" / "joycon2studio.desktop",
     ROOT / "packaging" / "linux" / "70-joycon2studio.rules",
     ROOT / "packaging" / "linux" / "joycon2studio.conf",

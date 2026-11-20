@@ -70,9 +70,28 @@ def package_files() -> list:
     return files
 
 
+def directories_of(names) -> list:
+    """Every folder above the files, parents first. dpkg needs these entries: it does not create the folders
+    for the files it unpacks, so without them the package fails with 'No such file or directory'."""
+    folders = set()
+    for name in names:
+        parts = name.split("/")
+        for depth in range(1, len(parts)):
+            folders.add("/".join(parts[:depth]))
+    return sorted(folders, key=lambda folder: (folder.count("/"), folder))
+
+
 def tar_gz(entries, prefix: str) -> bytes:
     buffer = io.BytesIO()
-    with tarfile.open(fileobj=buffer, mode="w:gz") as archive:
+    with tarfile.open(fileobj=buffer, mode="w:gz", format=tarfile.USTAR_FORMAT) as archive:
+        for folder in directories_of(name for name, _, _ in entries):
+            info = tarfile.TarInfo(prefix + folder + "/")
+            info.type = tarfile.DIRTYPE
+            info.mode = 0o755
+            info.mtime = 0
+            info.uid = info.gid = 0
+            info.uname = info.gname = "root"
+            archive.addfile(info)
         for name, data, mode in entries:
             info = tarfile.TarInfo(prefix + name)
             info.size = len(data)
