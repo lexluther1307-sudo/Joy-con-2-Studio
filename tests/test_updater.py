@@ -6,6 +6,7 @@ import io
 import json
 import os
 import shutil
+import ssl
 import sys
 import tempfile
 import unittest
@@ -105,7 +106,8 @@ class ChecksumTests(unittest.TestCase):
 class ReleaseTests(unittest.TestCase):
     def fake_api(self, data):
         body = json.dumps(data).encode("utf-8")
-        return mock.patch.object(updater.urllib.request, "urlopen", lambda req, timeout=None: FakeReply(body))
+        return mock.patch.object(updater.urllib.request, "urlopen",
+                                 lambda req, timeout=None, context=None: FakeReply(body))
 
     def release(self, version="0.2.9", zip_url=None, sums_url=None, tag=None):
         base = updater.DOWNLOAD_PREFIX + f"v{version}/"
@@ -338,6 +340,33 @@ class ManagerTests(unittest.TestCase):
         self.assertTrue(m.status()["enabled"])
         m.set_auto(False)
         self.assertFalse(self.manager().status()["enabled"])
+
+
+class TlsTests(unittest.TestCase):
+    def test_uses_the_system_bundle_when_it_exists(self):
+        bundle = updater.SYSTEM_CA_BUNDLES[1]
+        with mock.patch.object(updater.os.path, "isfile", side_effect=lambda path: path == bundle), \
+                mock.patch.object(updater.ssl, "create_default_context") as make:
+            updater.tls_context()
+        make.assert_called_once_with(cafile=bundle)
+
+    def test_falls_back_to_the_default_when_no_bundle_exists(self):
+        with mock.patch.object(updater.os.path, "isfile", return_value=False), \
+                mock.patch.object(updater.ssl, "create_default_context") as make:
+            updater.tls_context()
+        make.assert_called_once_with()
+
+    def test_a_release_is_read_with_a_verifying_context(self):
+        seen = []
+
+        def opener(req, timeout=None, context=None):
+            seen.append(context)
+            return FakeReply(json.dumps({"tag_name": "v0.2.9", "assets": []}).encode("utf-8"))
+
+        with mock.patch.object(updater.urllib.request, "urlopen", opener), self.assertRaises(UpdateError):
+            updater.latest_release()  # the answer has no release files, so the check stops there
+        self.assertIsInstance(seen[0], ssl.SSLContext)
+        self.assertEqual(seen[0].verify_mode, ssl.CERT_REQUIRED)
 
 
 if __name__ == "__main__":

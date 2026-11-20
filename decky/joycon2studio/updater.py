@@ -17,6 +17,7 @@ import json
 import os
 import re
 import shutil
+import ssl
 import subprocess
 import time
 import urllib.request
@@ -34,6 +35,17 @@ RETRY_WHEN_BUSY_SECONDS = 600  # a PC is connected: try again in ten minutes
 MAX_DOWNLOAD_BYTES = 20 * 1024 * 1024
 MAX_UNPACKED_BYTES = 60 * 1024 * 1024
 TIMEOUT_SECONDS = 30
+# The system's certificate authorities. Decky's Python on SteamOS does not find them by default
+# ("unable to get local issuer certificate"), so the bundle is loaded from its path.
+SYSTEM_CA_BUNDLES = ("/etc/ssl/certs/ca-certificates.crt", "/etc/ssl/cert.pem", "/etc/pki/tls/certs/ca-bundle.crt")
+
+
+def tls_context() -> ssl.SSLContext:
+    """A TLS context that checks the server certificate against the system's certificate authorities."""
+    for path in SYSTEM_CA_BUNDLES:
+        if os.path.isfile(path):
+            return ssl.create_default_context(cafile=path)
+    return ssl.create_default_context()
 
 
 class UpdateError(Exception):
@@ -67,7 +79,8 @@ def _request(url: str, accept: str):
 
 def latest_release() -> dict:
     """The newest GitHub release: its version, and the addresses of the plugin zip and the checksum file."""
-    with urllib.request.urlopen(_request(API_URL, "application/vnd.github+json"), timeout=TIMEOUT_SECONDS) as reply:
+    with urllib.request.urlopen(_request(API_URL, "application/vnd.github+json"), timeout=TIMEOUT_SECONDS,
+                                context=tls_context()) as reply:
         data = json.loads(reply.read(1024 * 1024).decode("utf-8"))
     version = ".".join(str(part) for part in parse_version(data.get("tag_name")))
     assets = {asset.get("name"): asset.get("browser_download_url", "") for asset in data.get("assets", [])}
@@ -80,7 +93,8 @@ def latest_release() -> dict:
 
 
 def download(url: str, dest: str, limit: int):
-    with urllib.request.urlopen(_request(url, "application/octet-stream"), timeout=TIMEOUT_SECONDS) as reply:
+    with urllib.request.urlopen(_request(url, "application/octet-stream"), timeout=TIMEOUT_SECONDS,
+                                context=tls_context()) as reply:
         with open(dest, "wb") as out:
             total = 0
             while True:
@@ -94,7 +108,7 @@ def download(url: str, dest: str, limit: int):
 
 
 def fetch_sums(url: str) -> str:
-    with urllib.request.urlopen(_request(url, "text/plain"), timeout=TIMEOUT_SECONDS) as reply:
+    with urllib.request.urlopen(_request(url, "text/plain"), timeout=TIMEOUT_SECONDS, context=tls_context()) as reply:
         return reply.read(64 * 1024).decode("utf-8", errors="replace")
 
 
