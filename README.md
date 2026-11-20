@@ -8,7 +8,10 @@ The Windows app connects the Joy-Cons over Bluetooth LE and presents them to Win
 
 ## Download
 
-[Joy-Con 2 Studio for Windows](https://github.com/lexluther1307-sudo/Joy-con-2-Studio/releases/latest): download `JoyCon2Studio.exe` from the latest release. It needs no Python, but it still needs the ViGEmBus driver (see Requirements).
+[Joy-Con 2 Studio for Windows](https://github.com/lexluther1307-sudo/Joy-con-2-Studio/releases/latest): download `JoyCon2Studio.exe` from the latest release. It needs no Python.
+
+- The virtual controller needs the ViGEmBus driver. If the app shows **MISSING ViGEmBus**, click **Install ViGEmBus driver**. It downloads the official installer, checks that it is signed by Nefarius, and runs it after you approve the Windows admin prompt.
+- The app checks GitHub for a newer release when it starts. If there is one, the button at the top right changes to **Get** and the new version.
 
 Before you run it:
 - Check its SHA-256 hash against the one in the release notes: `certutil -hashfile JoyCon2Studio.exe SHA256`.

@@ -3,12 +3,17 @@ import collections
 import ctypes
 import json
 import os
+import shutil
 import socket
 import struct
+import subprocess
 import sys
+import tempfile
 import threading
 import time
 import tkinter as tk
+import urllib.request
+import webbrowser
 from tkinter import colorchooser
 from bleak import BleakClient, BleakScanner
 
@@ -1173,6 +1178,141 @@ class JoyConCard(tk.Frame):
         )
 
 
+# --- ViGEmBus driver: the virtual controller needs it ---------------------------
+
+VIGEMBUS_API = "https://api.github.com/repos/nefarius/ViGEmBus/releases/latest"
+VIGEMBUS_PAGE = "https://github.com/nefarius/ViGEmBus/releases/latest"
+VIGEMBUS_PUBLISHER = "Nefarius"  # the installer must be signed by this publisher
+NO_WINDOW = 0x08000000  # CREATE_NO_WINDOW: keeps PowerShell from flashing a console
+
+
+def vigembus_installed() -> bool:
+    """True when the ViGEmBus driver service is registered on this PC."""
+    try:
+        import winreg
+
+        key = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"SYSTEM\CurrentControlSet\Services\ViGEmBus")
+        winreg.CloseKey(key)
+        return True
+    except OSError:
+        return False
+
+
+def find_vigembus_installer() -> tuple[str, str]:
+    """(file name, download URL) of the installer in the latest official ViGEmBus release."""
+    req = urllib.request.Request(
+        VIGEMBUS_API,
+        headers={"Accept": "application/vnd.github+json", "User-Agent": "Joy-Con-2-Studio"},
+    )
+    with urllib.request.urlopen(req, timeout=20) as resp:
+        release = json.load(resp)
+    for asset in release.get("assets", []):
+        name = asset.get("name", "")
+        if name.lower().startswith("vigembus") and name.lower().endswith(".exe"):
+            return name, asset["browser_download_url"]
+    raise RuntimeError("the latest ViGEmBus release has no installer")
+
+
+def signature_ok(path: str, publisher: str) -> tuple[bool, str]:
+    """Checks a file's Authenticode signature. Returns (trusted, name of the signer)."""
+    quoted = path.replace("'", "''")
+    script = (
+        f"$s = Get-AuthenticodeSignature -LiteralPath '{quoted}'; "
+        "$subject = [string]$s.SignerCertificate.Subject; "
+        # ASCII only, so the output reads the same whatever language the PC uses
+        "[pscustomobject]@{Status = [string]$s.Status; Subject = ($subject -replace '[^\\x20-\\x7E]', '?')} "
+        "| ConvertTo-Json -Compress"
+    )
+    run = subprocess.run(
+        ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", script],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=60,
+        creationflags=NO_WINDOW,
+    )
+    info = json.loads((run.stdout or "").strip() or "{}")
+    subject = info.get("Subject") or ""
+    return info.get("Status") == "Valid" and publisher.lower() in subject.lower(), subject
+
+
+def download_file(url: str, dest: str, progress) -> None:
+    req = urllib.request.Request(url, headers={"User-Agent": "Joy-Con-2-Studio"})
+    with urllib.request.urlopen(req, timeout=60) as resp, open(dest, "wb") as out:
+        total = int(resp.headers.get("Content-Length") or 0)
+        done = 0
+        while chunk := resp.read(64 * 1024):
+            out.write(chunk)
+            done += len(chunk)
+            if total:
+                progress(done * 100 // total)
+
+
+def run_as_admin(path: str) -> None:
+    """Runs the installer elevated. Windows shows the UAC prompt first; raises if it is declined or fails."""
+    quoted = path.replace("'", "''")
+    script = f"Start-Process -FilePath '{quoted}' -Verb RunAs -Wait"
+    run = subprocess.run(
+        ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", script],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        creationflags=NO_WINDOW,
+    )
+    if run.returncode != 0:
+        raise RuntimeError("the administrator prompt was declined or the installer failed")
+
+
+def install_vigembus_driver(log, progress) -> bool:
+    """Downloads ViGEmBus from its official GitHub release, checks the signature and runs it as administrator.
+    Returns True once the driver is registered."""
+    name, url = find_vigembus_installer()
+    workdir = tempfile.mkdtemp(prefix="JoyCon2Studio-")
+    try:
+        path = os.path.join(workdir, name)
+        log(f"Downloading {name} from the ViGEmBus GitHub release...")
+        download_file(url, path, progress)
+        trusted, signer = signature_ok(path, VIGEMBUS_PUBLISHER)
+        if not trusted:
+            raise RuntimeError(f"the installer is not signed by {VIGEMBUS_PUBLISHER} (signer: {signer or 'none'})")
+        log("Signature checked. Windows will ask for permission to install the driver.")
+        run_as_admin(path)
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+    return vigembus_installed()
+
+
+# --- Update check: asks GitHub for the newest release ---------------------------
+
+APP_VERSION = "0.1.1"
+UPDATE_API = "https://api.github.com/repos/lexluther1307-sudo/Joy-con-2-Studio/releases/latest"
+RELEASES_PAGE = "https://github.com/lexluther1307-sudo/Joy-con-2-Studio/releases/latest"
+
+
+def version_tuple(text: str):
+    """'v0.1.2' -> (0, 1, 2). None if the text is not a three-part version."""
+    parts = text.strip().lstrip("vV").split(".")
+    if len(parts) == 3 and all(p.isdigit() for p in parts):
+        return tuple(int(p) for p in parts)
+    return None
+
+
+def check_for_update() -> tuple[bool, str, str]:
+    """(a newer release exists, its tag, its page URL). Raises if GitHub cannot be reached."""
+    req = urllib.request.Request(
+        UPDATE_API,
+        headers={"Accept": "application/vnd.github+json", "User-Agent": "Joy-Con-2-Studio"},
+    )
+    with urllib.request.urlopen(req, timeout=10) as resp:
+        release = json.load(resp)
+    latest = release.get("tag_name", "")
+    latest_v = version_tuple(latest)
+    newer = latest_v is not None and latest_v > version_tuple(APP_VERSION)
+    return newer, latest, release.get("html_url") or RELEASES_PAGE
+
+
 class JoyCon2App(tk.Tk):
     def __init__(self):
         super().__init__()
@@ -1189,12 +1329,73 @@ class JoyCon2App(tk.Tk):
         self._build_status_bar()
         self._build_tools()
         self._build_cards()
+        self._refresh_virtual_pill()
+        self.after(1000, lambda: self._start_update_check(manual=False))  # once the window is up
         self._tick()
         if self.auto_scan_var.get():
             self.manager.start_scan(12.0)
 
     def _set_status(self, msg: str):
         self.after(0, lambda: self.status_var.set(msg))
+
+    def _refresh_virtual_pill(self):
+        if HAS_VGAMEPAD and vigembus_installed():
+            self.virtual_pill.config(text="Virtual controller: READY", fg=GOOD, bg=GOOD_BG)
+            self.install_btn.pack_forget()
+        else:
+            self.virtual_pill.config(text="Virtual controller: MISSING ViGEmBus", fg=WARN, bg=SURFACE_2)
+            if HAS_VGAMEPAD:
+                self.install_btn.pack(side="left", padx=8)
+            else:
+                self.install_btn.pack_forget()
+
+    def _install_vigembus(self):
+        self.install_btn.config(state="disabled", text="Installing...")
+
+        def worker():
+            try:
+                ok = install_vigembus_driver(
+                    self._set_status,
+                    lambda pct: self._set_status(f"Downloading the ViGEmBus driver... {pct}%"),
+                )
+                msg = (
+                    "ViGEmBus driver installed. The virtual controller is ready."
+                    if ok
+                    else "The installer finished, but the driver is not registered. Try again, or restart the PC."
+                )
+            except Exception as e:
+                ok = False
+                msg = f"ViGEmBus install failed: {e}. You can install it by hand from {VIGEMBUS_PAGE}"
+            self.after(0, lambda: self._install_finished(ok, msg))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _install_finished(self, ok: bool, msg: str):
+        self.install_btn.config(state="normal", text="Install ViGEmBus driver")
+        if ok:
+            self.manager._ds4_failed = False  # the virtual pad can be created now
+        self._set_status(msg)
+        self._refresh_virtual_pill()
+
+    def _start_update_check(self, manual: bool):
+        # Runs at startup (quiet unless a newer release exists) and from the Check for updates button
+        def worker():
+            try:
+                newer, latest, url = check_for_update()
+            except Exception as e:
+                if manual:
+                    self._set_status(f"Could not check for updates: {e}")
+                return
+            if newer:
+                self.after(0, lambda: self._update_found(latest, url))
+            elif manual:
+                self._set_status(f"You have the latest version ({APP_VERSION}).")
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _update_found(self, latest: str, url: str):
+        self.update_btn.config(text=f"Get {latest}", command=lambda: webbrowser.open(url))
+        self._set_status(f"Update available: {latest} (you have {APP_VERSION}). Use the Get {latest} button.")
 
     def _build_header(self):
         head = tk.Frame(self, bg=BG)
@@ -1203,10 +1404,8 @@ class JoyCon2App(tk.Tk):
         tk.Label(head, text="controller tools", font=(FONT, 10), fg=MUTED, bg=BG).pack(
             side="left", padx=(10, 0), pady=(5, 0)
         )
-        if HAS_VGAMEPAD:
-            make_pill(head, "Virtual controller: READY", GOOD, GOOD_BG).pack(side="right")
-        else:
-            make_pill(head, "Virtual controller: MISSING ViGEmBus", WARN, SURFACE_2).pack(side="right")
+        self.virtual_pill = make_pill(head, "", WARN, SURFACE_2)
+        self.virtual_pill.pack(side="right")
 
     def _build_toolbar(self):
         bar = tk.Frame(self, bg=BG)
@@ -1218,6 +1417,13 @@ class JoyCon2App(tk.Tk):
         make_button(bar, "Disconnect all", self.manager.disconnect_all, style="danger", padx=12, pady=7).pack(
             side="left"
         )
+        self.install_btn = make_button(
+            bar, "Install ViGEmBus driver", self._install_vigembus, style="primary", padx=12, pady=7
+        )
+        self.update_btn = make_button(
+            bar, "Check for updates", lambda: self._start_update_check(manual=True), padx=12, pady=7
+        )
+        self.update_btn.pack(side="right")
 
     def _build_status_bar(self):
         bar = tk.Frame(self, bg=SURFACE, padx=16, pady=7)
