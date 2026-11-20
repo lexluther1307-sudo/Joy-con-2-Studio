@@ -1,0 +1,6 @@
+{
+  "name": "Joy-Con 2 Studio",
+  "author": "Joy-Con 2 Studio (local build)",
+  "flags": ["root", "_root"],
+  "api_version": 1
+}

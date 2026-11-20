@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.pyc
+
+# Windows build output (PyInstaller)
+/build/
+/dist/
+*.exe
+
+# Decky plugin build
+node_modules/
+*.js.map
+
+# Local settings and device data
+/settings.json
+/spi_backup/
+*.bin
+*.log
+
+# Packaged zips
+*.zip
