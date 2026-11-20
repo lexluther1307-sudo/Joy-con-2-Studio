@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Joy-Con 2 Studio
+Comment=Use Nintendo Switch 2 Joy-Con 2 controllers as a gamepad and mouse
+Exec=joycon2studio
+Icon=input-gaming
+Terminal=false
+Categories=Utility;Game;
+Keywords=Joy-Con;Switch;Nintendo;controller;gamepad;mouse;
+StartupNotify=false

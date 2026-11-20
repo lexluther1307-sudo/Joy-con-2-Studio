@@ -3,6 +3,15 @@ import { ButtonItem, PanelSection, PanelSectionRow, staticClasses } from "@decky
 import { callable, definePlugin } from "@decky/api";
 import { FaWifi } from "react-icons/fa";
 
+type UpdateInfo = {
+  enabled: boolean; // automatic updates on or off
+  current: string; // the installed version
+  latest: string; // the newest release found, or ""
+  state: string; // "waiting" | "checking" | "installing" | "restarting" | "uptodate" | "error" | "done"
+  message: string;
+  last_check: number; // Unix time of the last check, 0 if none yet
+};
+
 type Status = {
   version: string;
   pad_ok: boolean;
@@ -15,6 +24,7 @@ type Status = {
   scanning: boolean;
   scan_result: string[];
   message: string;
+  update: UpdateInfo;
 };
 
 const getStatus = callable<[], Status>("status");
@@ -22,11 +32,18 @@ const scanNetwork = callable<[], boolean>("scan");
 const disconnectPc = callable<[], boolean>("disconnect");
 const connectPc = callable<[], boolean>("connect");
 const newPairingCode = callable<[], boolean>("new_pairing_code");
+const setAutoUpdate = callable<[boolean], boolean>("set_auto_update");
+const checkUpdateNow = callable<[], boolean>("check_update_now");
 
 function linkLine(s: Status): string {
   if (s.link_state === "connected") return `Connected to the PC at ${s.pc_address}`;
   if (s.link_state === "refused") return "Disconnected by you. Press Connect to accept the PC again.";
   return "Waiting for the PC. Enter this pairing code on the PC.";
+}
+
+function updateLine(u: UpdateInfo): string {
+  if (u.latest && u.latest !== u.current) return `Version ${u.current}. Version ${u.latest} is available.`;
+  return `Version ${u.current}. Automatic updates are ${u.enabled ? "on" : "off"}.`;
 }
 
 const Content = () => {
@@ -115,6 +132,25 @@ const Content = () => {
             <div>{line}</div>
           </PanelSectionRow>
         ))}
+      </PanelSection>
+
+      <PanelSection title="Updates">
+        <PanelSectionRow>
+          <div>{updateLine(status.update)}</div>
+        </PanelSectionRow>
+        <PanelSectionRow>
+          <ButtonItem layout="below" onClick={() => setAutoUpdate(!status.update.enabled)}>
+            {status.update.enabled ? "Turn automatic updates off" : "Turn automatic updates on"}
+          </ButtonItem>
+        </PanelSectionRow>
+        <PanelSectionRow>
+          <ButtonItem layout="below" onClick={() => checkUpdateNow()}>
+            Check for updates now
+          </ButtonItem>
+        </PanelSectionRow>
+        <PanelSectionRow>
+          <div>{status.update.message}</div>
+        </PanelSectionRow>
       </PanelSection>
     </>
   );

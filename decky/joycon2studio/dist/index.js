@@ -87,12 +87,19 @@ const scanNetwork = callable("scan");
 const disconnectPc = callable("disconnect");
 const connectPc = callable("connect");
 const newPairingCode = callable("new_pairing_code");
+const setAutoUpdate = callable("set_auto_update");
+const checkUpdateNow = callable("check_update_now");
 function linkLine(s) {
     if (s.link_state === "connected")
         return `Connected to the PC at ${s.pc_address}`;
     if (s.link_state === "refused")
         return "Disconnected by you. Press Connect to accept the PC again.";
     return "Waiting for the PC. Enter this pairing code on the PC.";
+}
+function updateLine(u) {
+    if (u.latest && u.latest !== u.current)
+        return `Version ${u.current}. Version ${u.latest} is available.`;
+    return `Version ${u.current}. Automatic updates are ${u.enabled ? "on" : "off"}.`;
 }
 const Content = () => {
     const [status, setStatus] = SP_REACT.useState(null);
@@ -149,7 +156,16 @@ const Content = () => {
             SP_REACT.createElement(DFL.PanelSectionRow, null,
                 SP_REACT.createElement(DFL.ButtonItem, { layout: "below", onClick: () => scanNetwork() }, status.scanning ? "Scanning..." : "Scan network")),
             (status.scan_result ?? []).map((line, i) => (SP_REACT.createElement(DFL.PanelSectionRow, { key: `scan${i}` },
-                SP_REACT.createElement("div", null, line)))))));
+                SP_REACT.createElement("div", null, line))))),
+        SP_REACT.createElement(DFL.PanelSection, { title: "Updates" },
+            SP_REACT.createElement(DFL.PanelSectionRow, null,
+                SP_REACT.createElement("div", null, updateLine(status.update))),
+            SP_REACT.createElement(DFL.PanelSectionRow, null,
+                SP_REACT.createElement(DFL.ButtonItem, { layout: "below", onClick: () => setAutoUpdate(!status.update.enabled) }, status.update.enabled ? "Turn automatic updates off" : "Turn automatic updates on")),
+            SP_REACT.createElement(DFL.PanelSectionRow, null,
+                SP_REACT.createElement(DFL.ButtonItem, { layout: "below", onClick: () => checkUpdateNow() }, "Check for updates now")),
+            SP_REACT.createElement(DFL.PanelSectionRow, null,
+                SP_REACT.createElement("div", null, status.update.message)))));
 };
 var index = definePlugin(() => {
     return {

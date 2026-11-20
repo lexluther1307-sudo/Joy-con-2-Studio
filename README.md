@@ -1,10 +1,10 @@
 # Joy-Con 2 Studio
 
-Use Nintendo Switch 2 Joy-Con 2 controllers on Windows and on a Steam Deck.
+Use Nintendo Switch 2 Joy-Con 2 controllers on Windows, on Linux (Arch and Ubuntu), and on a Steam Deck.
 
-The Windows app connects the Joy-Cons over Bluetooth LE and presents them to Windows and Steam as a virtual DualShock 4: sticks, buttons, gyro, accelerometer and rumble. The Steam Deck plugin (Decky Loader) can take the controllers from the PC over the network, so the Joy-Cons can stay on the PC.
+The Windows app connects the Joy-Cons over Bluetooth LE and presents them to Windows and Steam as a virtual DualShock 4: sticks, buttons, gyro, accelerometer and rumble. The Linux app does the same through `/dev/uhid`, and can use a Joy-Con as a mouse through `/dev/uinput`. The Steam Deck plugin (Decky Loader) can take the controllers from the PC over the network, so the Joy-Cons can stay on the PC.
 
-> **Experimental and unofficial.** Tested on Windows 11 with a left and a right Joy-Con 2. The Steam Deck plugin uses Wi-Fi only; it does not pair over Bluetooth. The network bridge to the Deck is new and has not been tested end to end with Steam.
+> **Experimental and unofficial.** Tested on Windows 11 with a left and a right Joy-Con 2. The Linux app has not been tested on Linux hardware yet. The Steam Deck plugin uses Wi-Fi only; it does not pair over Bluetooth. The network bridge to the Deck is new and has not been tested end to end with Steam.
 
 ## Download
 
@@ -17,6 +17,8 @@ Before you run it:
 - Check its SHA-256 hash against the one in the release notes: `certutil -hashfile JoyCon2Studio.exe SHA256`.
 - Windows SmartScreen may warn about an unknown publisher, because the exe is not code-signed. Click More info > Run anyway only if the hash matches.
 
+For Arch Linux and Ubuntu, build the packages from this repository. See [Linux app (Arch and Ubuntu)](#linux-app-arch-and-ubuntu).
+
 ## Features
 
 Windows app (`joycon2_gui.py`):
@@ -26,17 +28,28 @@ Windows app (`joycon2_gui.py`):
 - Mouse mode: use a Joy-Con as a mouse (ZR = left click, R = right click).
 - Network bridge: sends the controller state to a Steam Deck over an encrypted link. While the Deck is connected, this PC does not use the Joy-Cons.
 
+Linux app (`joycon2_gui.py` with `uhid_pad.py` and `linux_mouse.py`):
+- Connects Joy-Con 2 L and R over Bluetooth LE through BlueZ, with the same screens and mouse mode as on Windows.
+- Creates a virtual DualShock 4 through `/dev/uhid`, and a virtual mouse through `/dev/uinput`.
+- Packaged for Arch Linux (`PKGBUILD`) and Ubuntu (`.deb`). Has the same network bridge to the Deck.
+
 Steam Deck plugin (`decky/joycon2studio`):
-- Receives controller state from the Windows app over an encrypted Wi-Fi link and presents it to Steam as a virtual DualShock 4 through `/dev/uhid`.
+- Receives controller state from the PC over an encrypted Wi-Fi link and presents it to Steam as a virtual DualShock 4 through `/dev/uhid`.
 - Sends Steam's rumble back to the PC. Shows a pairing code, has Connect and Disconnect buttons, and a Scan network button.
+- Updates itself from the project's latest GitHub release. See [its README](decky/joycon2studio/README.md#updates).
 
 ## Requirements
 
+Windows:
 - Windows 10 or 11 with Bluetooth LE.
 - Python with tkinter (the app was built with Python 3.15).
 - `pip install bleak vgamepad`
 - The [ViGEmBus](https://github.com/nefarius/ViGEmBus) driver, which vgamepad needs.
 - Nintendo Switch 2 Joy-Con 2 controllers. The original Joy-Con is not supported.
+
+Linux (the packages install these):
+- Python 3 with tkinter, `bleak` and BlueZ, and a Bluetooth adapter.
+- Ubuntu 24.04 or newer, or Arch Linux.
 
 ## Windows app
 
@@ -56,21 +69,52 @@ py -m PyInstaller JoyCon2Studio.spec
 
 The exe is written to `dist\JoyCon2Studio.exe`.
 
+## Linux app (Arch and Ubuntu)
+
+The packages are built from this repository, and the build needs only Python 3:
+
+```bash
+python3 tools/build_linux.py
+```
+
+It writes `build/linux/joycon2studio_<version>_all.deb` for Ubuntu, and `build/linux/arch/` with the PKGBUILD and its source tarball for Arch Linux.
+
+On Ubuntu 24.04 or newer:
+
+```bash
+sudo apt install ./build/linux/joycon2studio_*_all.deb
+```
+
+On Arch Linux (`python-bleak` is in the official extra repository):
+
+```bash
+cd build/linux/arch && makepkg -si
+```
+
+Then log out and back in, or reboot, so that the access rule for `/dev/uhid` and `/dev/uinput` applies. Open **Joy-Con 2 Studio** from the application menu, or run `joycon2studio`.
+
+- Hold SYNC on each Joy-Con, as on Windows, then press **Scan for Joy-Cons**. Pairing on Linux has not been tested on hardware.
+- The virtual controller is a DualShock 4, through `/dev/uhid`. The Xbox 360 output is Windows only.
+- Linux has no tray icon. Closing the window keeps the app running in the background, so the Joy-Cons stay connected. Start the app again to show the window, and use **Quit** on the About page to stop it.
+- If the status line says the virtual controller needs `/dev/uhid`, or the mouse needs `/dev/uinput`, log out and back in. Or load the modules with `sudo modprobe uhid uinput`.
+
 ## Steam Deck
 
 ### Install the plugin
 
 1. Install Decky Loader on the Deck.
-2. Copy the `decky/joycon2studio` folder to the Deck, or unzip `joycon2studio-plugin.zip` from the release.
+2. Copy the `decky/joycon2studio` folder to the Deck, or unzip `joycon2studio-plugin-<version>.zip` from the release.
 3. In Konsole (Desktop Mode), go into that folder and run `bash install.sh`. It asks for your sudo password, installs the plugin to `~/homebrew/plugins/joycon2studio` and restarts the plugin loader. An older version is moved to `~/joycon2studio-backup-<date>`.
 4. Open the Quick Access menu and pick Joy-Con 2 Studio.
+
+The plugin then updates itself from the latest release. See [its README](decky/joycon2studio/README.md#updates).
 
 ### Network bridge (Joy-Cons stay on the PC)
 
 The Deck does not pair with the Joy-Cons. The PC keeps them and sends their state to the Deck over Wi-Fi.
 
 1. Install the plugin above and put the PC and the Deck on the same network.
-2. In the Windows app, enter the Deck's IP address and the six-digit pairing code shown on the Deck, then tick "Connect to a Deck (encrypted)".
+2. In the Windows or Linux app, enter the Deck's IP address and the six-digit pairing code shown on the Deck, then tick "Connect to a Deck (encrypted)".
 3. Steam on the Deck should show the controller, and Steam's rumble is sent back to the PC.
 4. On the Deck, press **Scan network** to check that the PC is sending.
 
@@ -78,7 +122,7 @@ The link uses UDP port 26761. Pairing uses SPAKE2, so a recorded handshake canno
 
 ## Troubleshooting
 
-- Windows: the status line in the app says what failed.
+- Windows and Linux: the status line in the app says what failed.
 - Steam Deck: in Konsole, run `journalctl -u plugin_loader -b --no-pager | tail -n 200` and send the output with the status line.
 
 ## Known limits
@@ -88,12 +132,26 @@ The link uses UDP port 26761. Pairing uses SPAKE2, so a recorded handshake canno
 - Gyro and accelerometer scaling are first guesses.
 - The Home button is not verified in Steam.
 - The Deck plugin runs as root, which `/dev/uhid` requires.
+- The Linux app is not tested on Linux hardware yet. Its virtual controller and mouse were written from the Windows app and the Deck plugin, and are checked only by unit tests.
+- The Linux app has no tray icon; closing its window keeps it running in the background.
+- Automatic updates for the Deck need a published GitHub release with `joycon2studio-plugin-<version>.zip` and `SHA256SUMS.txt`. The checksum guards against a damaged download, not against a release that someone changed.
 - The encryption has not been audited. Each connection uses fresh keys, so a leaked pairing code does not expose recorded past traffic. The code also changes after every disconnect; press New pairing code on the Deck to change it sooner.
 - The Joy-Con 2 protocol was worked out by reverse engineering, so a firmware update may break it.
+
+## Tests
+
+From this folder:
+
+```bash
+python3 -m unittest discover -s tests -p "test_*.py"
+```
+
+These cover the Deck updater, the uhid gamepad, the Linux mouse and the DualShock 4 report. They need no Joy-Cons or devices.
 
 ## Credits and third-party code
 
 - Protocol details (UUIDs and the rumble setup sequence) come from joycon2cpp, a community project.
+
 ## Disclaimer
 
 This project is not affiliated with or endorsed by Nintendo. Joy-Con and Nintendo Switch are trademarks of Nintendo. Use at your own risk.

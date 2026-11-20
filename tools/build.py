@@ -30,13 +30,20 @@ SPEC = ROOT / "JoyCon2Studio.spec"
 STATE_FILE = ROOT / "build" / "version-state.json"
 RELEASE_DIR = ROOT / "build" / "release"
 PROJECT_EXE = ROOT / "JoyCon2Studio.exe"  # the copy in the project folder, the one you run
-PLUGIN_FILES = ["plugin.json", "main.py", "joycon2_link.py", "package.json", "README.md", "install.sh", "dist/index.js"]
+PLUGIN_FILES = ["plugin.json", "main.py", "joycon2_link.py", "uhid_pad.py", "updater.py", "package.json",
+                "README.md", "install.sh", "dist/index.js"]
 SOURCES = [
     APP,
     SPEC,
     ROOT / "README.md",
+    ROOT / "linux_mouse.py",
+    ROOT / "packaging" / "linux" / "joycon2studio.desktop",
+    ROOT / "packaging" / "linux" / "70-joycon2studio.rules",
+    ROOT / "packaging" / "linux" / "joycon2studio.conf",
     PLUGIN / "joycon2_link.py",
     PLUGIN / "main.py",
+    PLUGIN / "uhid_pad.py",
+    PLUGIN / "updater.py",
     PLUGIN / "install.sh",
     PLUGIN / "plugin.json",
     PLUGIN / "package.json",

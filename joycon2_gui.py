@@ -20,15 +20,24 @@ from tkinter import colorchooser
 from tkinter import font as tkfont
 from bleak import BleakClient, BleakScanner
 
-# The encrypted Deck link is shared with the Deck plugin (standard library only)
+IS_WINDOWS = sys.platform == "win32"
+IS_LINUX = sys.platform.startswith("linux")
+
+# The encrypted Deck link and the uhid gamepad are shared with the Deck plugin (standard library only)
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "decky", "joycon2studio"))
 from joycon2_link import PcLink  # noqa: E402
 
-try:
-    import vgamepad as vg
-    HAS_VGAMEPAD = True
-except Exception:
-    HAS_VGAMEPAD = False
+vg = None
+HAS_VGAMEPAD = False
+if IS_WINDOWS:
+    try:
+        import vgamepad as vg
+        HAS_VGAMEPAD = True
+    except Exception:
+        pass
+if IS_LINUX:
+    from linux_mouse import UinputMouse  # noqa: E402
+    from uhid_pad import UhidGamepad  # noqa: E402
 
 # Nintendo Switch 2 BLE UUIDs
 SERVICE_UUID = "ab7de9be-89fe-49ad-828f-118f09df7fd0"
@@ -210,6 +219,11 @@ def apply_color_reply(state, data: bytes) -> bool:
 
 
 def _settings_path() -> str:
+    if IS_LINUX:
+        # A packaged install lives in /usr, so the settings go in the user's config folder
+        folder = os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"), "joycon2studio")
+        os.makedirs(folder, exist_ok=True)
+        return os.path.join(folder, "settings.json")
     # Next to the exe when frozen, otherwise next to this script
     if getattr(sys, "frozen", False):
         base = os.path.dirname(sys.executable)
@@ -356,8 +370,12 @@ class JoyCon2Manager:
         self.rumble_sample = 1
         self.left.rumble_request = lambda: self.rumble_test(self.left)
         self.right.rumble_request = lambda: self.rumble_test(self.right)
-        self.output = load_settings().get("output", "ds4")
+        self.output = "ds4" if IS_LINUX else load_settings().get("output", "ds4")  # Linux makes only a DualShock 4
         self.ds4 = None
+        self.uhid_pad = None  # Linux: this PC's DualShock 4, made through /dev/uhid by _local_pad_loop
+        self.want_local_pad = False  # Linux: True while this PC, not the Deck, should show the controller
+        self.local_pad_message = ""
+        self.uinput_mouse = None  # Linux: this PC's mouse, made through /dev/uinput
         self._ds4_failed = False
         self.rumble_large = 0
         self.rumble_small = 0
@@ -377,6 +395,9 @@ class JoyCon2Manager:
 
         self.thread.start()
         asyncio.run_coroutine_threadsafe(self._rumble_loop(), self.loop)
+        if IS_LINUX:
+            self._open_uinput_mouse()
+            asyncio.run_coroutine_threadsafe(self._local_pad_loop(), self.loop)
 
     def _run_loop(self):
         asyncio.set_event_loop(self.loop)
@@ -701,10 +722,10 @@ class JoyCon2Manager:
 
     def _release_mouse_buttons(self, state: JoyConState):
         if state.mouse_left:
-            ctypes.windll.user32.mouse_event(0x0004, 0, 0, 0, 0)  # MOUSEEVENTF_LEFTUP
+            self._mouse_button("left", False)
             state.mouse_left = False
         if state.mouse_right:
-            ctypes.windll.user32.mouse_event(0x0010, 0, 0, 0, 0)  # MOUSEEVENTF_RIGHTUP
+            self._mouse_button("right", False)
             state.mouse_right = False
 
     def _move_cursor(self, state: JoyConState):
@@ -721,7 +742,7 @@ class JoyCon2Manager:
         if ix or iy:
             state.mouse_acc[0] -= ix
             state.mouse_acc[1] -= iy
-            ctypes.windll.user32.mouse_event(0x0001, ix, iy, 0, 0)  # MOUSEEVENTF_MOVE
+            self._mouse_move(ix, iy)
 
     def _mouse_clicks(self, state: JoyConState):
         if state.side != self.active_side or not self._is_mouse(state):
@@ -730,10 +751,10 @@ class JoyCon2Manager:
         left = bool(state.buttons & left_mask)
         right = bool(state.buttons & right_mask)
         if left != state.mouse_left:
-            ctypes.windll.user32.mouse_event(0x0002 if left else 0x0004, 0, 0, 0, 0)
+            self._mouse_button("left", left)
             state.mouse_left = left
         if right != state.mouse_right:
-            ctypes.windll.user32.mouse_event(0x0008 if right else 0x0010, 0, 0, 0, 0)
+            self._mouse_button("right", right)
             state.mouse_right = right
 
     def rumble_test(self, state: JoyConState):
@@ -1070,6 +1091,10 @@ class JoyCon2Manager:
         self._sync_virtual_gamepad()
 
     def _sync_virtual_gamepad(self):
+        if IS_LINUX:
+            # Linux: _local_pad_loop makes and removes this PC's DualShock 4, on the Bluetooth thread
+            self.want_local_pad = not self.deck_connected()
+            return
         if self.deck_connected():
             # The Deck has the controller while it is connected, so this PC's virtual controller stays unplugged
             self._release_virtual_gamepads()
@@ -1149,6 +1174,135 @@ class JoyCon2Manager:
         self.gamepad.right_joystick(x_value=rx, y_value=ry)
         self.gamepad.update()
 
+    # ---- Linux: this PC's own DualShock 4 (through /dev/uhid) and mouse (through /dev/uinput) ----
+
+    def _open_uinput_mouse(self):
+        try:
+            mouse = UinputMouse()
+            mouse.create()
+            self.uinput_mouse = mouse
+        except Exception as exc:
+            self.uinput_mouse = None
+            self.log(f"Mouse mode needs /dev/uinput ({exc}). See the About page.")
+
+    def _mouse_move(self, dx: int, dy: int):
+        if IS_WINDOWS:
+            ctypes.windll.user32.mouse_event(0x0001, dx, dy, 0, 0)  # MOUSEEVENTF_MOVE
+        elif self.uinput_mouse is not None:
+            self.uinput_mouse.move(dx, dy)
+
+    def _mouse_button(self, button: str, down: bool):
+        if IS_WINDOWS:
+            flags = {("left", True): 0x0002, ("left", False): 0x0004,
+                     ("right", True): 0x0008, ("right", False): 0x0010}
+            ctypes.windll.user32.mouse_event(flags[(button, down)], 0, 0, 0, 0)
+        elif self.uinput_mouse is not None:
+            self.uinput_mouse.button(button, down)
+
+    def _on_local_rumble(self, data: bytes):
+        # Steam's rumble to this PC's DualShock 4: report 0x05, small motor in byte 4, large motor in byte 5
+        if len(data) >= 6 and data[0] == 0x05:
+            self.rumble_small = data[4]
+            self.rumble_large = data[5]
+
+    def _local_ds4_report(self) -> bytes:
+        """This PC's controller as a 64-byte DualShock 4 input report, mapped the same way as _sync_ds4."""
+        rep = bytearray(64)
+        rep[0] = 0x01
+        rep[1] = rep[2] = rep[3] = rep[4] = 128  # sticks centred
+        face, shoulders, system, left_trigger, right_trigger = 8, 0, 0, 0, 0  # d-pad 8 = centred
+        driver = None
+        if self.sideways_single:
+            jc = self._sideways_joycon()
+            if jc is not None:
+                # Sideways: the Joy-Con in use is the whole controller, laid out like a pad
+                sx, sy, pressed = self._sideways_pad(jc)
+                rep[1], rep[2] = stick_byte(sx), stick_byte(-sy)
+                face_bits = {"A": 0x20, "B": 0x40, "X": 0x10, "Y": 0x80}  # Cross, Circle, Square, Triangle
+                shoulder_bits = {"LB": 0x01, "RB": 0x02, "START": 0x20, "LS": 0x40}
+                for name in pressed:
+                    face |= face_bits.get(name, 0)
+                    shoulders |= shoulder_bits.get(name, 0)
+                driver = jc
+        else:
+            left_on = self.left.connected and self._contributes(self.left)
+            right_on = self.right.connected and self._contributes(self.right)
+            b = (self.left.buttons if left_on else 0) | (self.right.buttons if right_on else 0)
+            lx = self._norm_axis(self.left.stick_x, self.left.center_x) if left_on else 0
+            ly = self._norm_axis(self.left.stick_y, self.left.center_y) if left_on else 0
+            rx = self._norm_axis(self.right.stick_x, self.right.center_x) if right_on else 0
+            ry = self._norm_axis(self.right.stick_y, self.right.center_y) if right_on else 0
+            rep[1], rep[2] = stick_byte(lx), stick_byte(-ly)  # DualShock 4 Y is inverted: 0 is up
+            rep[3], rep[4] = stick_byte(rx), stick_byte(-ry)
+            face = bridge_dpad(b & BTN_UP, b & BTN_DOWN, b & BTN_LEFT, b & BTN_RIGHT)
+            for mask, bit in ((BTN_Y, 0x10), (BTN_B, 0x20), (BTN_A, 0x40), (BTN_X, 0x80)):
+                if b & mask:
+                    face |= bit
+            for mask, bit in ((BTN_L, 0x01), (BTN_R, 0x02), (BTN_MINUS, 0x10), (BTN_PLUS, 0x20),
+                              (BTN_L3, 0x40), (BTN_R3, 0x80)):
+                if b & mask:
+                    shoulders |= bit
+            if b & BTN_ZL:
+                shoulders |= 0x04
+                left_trigger = 255
+            if b & BTN_ZR:
+                shoulders |= 0x08
+                right_trigger = 255
+            if b & BTN_HOME:
+                system |= 0x01
+            if b & BTN_CAPTURE:
+                system |= 0x02
+            driver = self.right if right_on else (self.left if left_on else None)
+        rep[5] = face
+        rep[6] = shoulders
+        rep[7] = system
+        rep[8] = left_trigger
+        rep[9] = right_trigger
+        struct.pack_into("<H", rep, 10, int(time.monotonic() * 187500) & 0xFFFF)
+        if driver is not None:
+            # DualShock 4 units: 16 LSB per deg/s and 8192 LSB per g
+            struct.pack_into("<hhh", rep, 13, *(clamp16(int(v * 16)) for v in
+                                                (driver.gyro_x, driver.gyro_y, driver.gyro_z)))
+            struct.pack_into("<hhh", rep, 19, *(clamp16(int(v * 8192)) for v in
+                                                (driver.accel_x, driver.accel_y, driver.accel_z)))
+        rep[30] = 0x1B
+        return bytes(rep)
+
+    async def _local_pad_loop(self):
+        """Linux: keeps this PC's DualShock 4 in place while the Joy-Cons drive it, about 100 times a second."""
+        pad = None
+        retry_at = 0.0
+        while True:
+            now = time.monotonic()
+            want = self.want_local_pad and self.output == "ds4"
+            if want and pad is None and now >= retry_at:
+                try:
+                    pad = UhidGamepad(self.loop, self._on_local_rumble)
+                    pad.create()
+                    self.uhid_pad = pad
+                    self.local_pad_message = ""
+                except Exception as exc:
+                    pad = None
+                    self.uhid_pad = None
+                    message = (f"needs /dev/uhid ({exc.strerror or exc})" if isinstance(exc, OSError)
+                               else f"could not start ({exc})")
+                    if message != self.local_pad_message:
+                        self.local_pad_message = message
+                        self.log(f"Virtual controller {message}. See the About page.")
+                    retry_at = now + 5.0
+            elif not want and pad is not None:
+                pad.destroy()  # the Deck has the controller now, or the output was changed
+                pad = None
+                self.uhid_pad = None
+                self.rumble_large = self.rumble_small = 0
+            if pad is not None:
+                try:
+                    pad.send_input(self._local_ds4_report())
+                except OSError as exc:
+                    self.local_pad_message = f"write failed ({exc.strerror or exc})"
+                    self.log(f"Virtual controller {self.local_pad_message}.")
+            await asyncio.sleep(0.01)
+
 
 # ---- Look and feel ----------------------------------------------------------
 # --- Material 3 colour roles (dark scheme). The names follow the M3 roles, so the palette can be swapped. ---
@@ -1181,8 +1335,8 @@ BAD = ERROR                  # low battery
 ACCENT = PRIMARY             # bars
 ACTIVE_L = "#38BDF8"         # buttons pressed on the Joy-Con preview
 ACTIVE_R = "#F87171"
-FONT = "Segoe UI"
-MONO = "Consolas"
+FONT = "Segoe UI" if IS_WINDOWS else "DejaVu Sans"
+MONO = "Consolas" if IS_WINDOWS else "DejaVu Sans Mono"
 
 
 def _mix(a: str, b: str, t: float) -> str:
@@ -1946,7 +2100,7 @@ def install_vigembus_driver(log, progress) -> bool:
 
 # --- Update check: asks GitHub for the newest release ---------------------------
 
-APP_VERSION = "0.2.8"
+APP_VERSION = "0.2.9"
 UPDATE_API = "https://api.github.com/repos/lexluther1307-sudo/Joy-con-2-Studio/releases/latest"
 RELEASES_PAGE = "https://github.com/lexluther1307-sudo/Joy-con-2-Studio/releases/latest"
 
@@ -1987,7 +2141,8 @@ NIF_MESSAGE, NIF_ICON, NIF_TIP = 0x1, 0x2, 0x4
 MF_STRING = 0x0000
 TPM_RIGHTBUTTON = 0x0002
 IDM_SHOW, IDM_QUIT = 1001, 1002
-_WNDPROC = ctypes.WINFUNCTYPE(ctypes.c_ssize_t, ctypes.c_void_p, ctypes.c_uint, ctypes.c_size_t, ctypes.c_ssize_t)
+_WNDPROC = (ctypes.WINFUNCTYPE(ctypes.c_ssize_t, ctypes.c_void_p, ctypes.c_uint, ctypes.c_size_t, ctypes.c_ssize_t)
+            if IS_WINDOWS else ctypes.c_void_p)  # a placeholder type on Linux, where the tray is not used
 
 
 class _WNDCLASSEXW(ctypes.Structure):
@@ -2178,14 +2333,17 @@ class JoyCon2App(tk.Tk):
         self._events = queue.Queue()
         self._quitting = False
         self._tray = None
-        try:
-            self._tray = TrayIcon("Joy-Con 2 Studio", self._events)
-            if self._tray._hwnd is None:
+        if IS_WINDOWS:
+            try:
+                self._tray = TrayIcon("Joy-Con 2 Studio", self._events)
+                if self._tray._hwnd is None:
+                    self._tray = None
+            except Exception:
                 self._tray = None
-        except Exception:
-            self._tray = None
-        if self._tray is not None:
-            self.protocol("WM_DELETE_WINDOW", self._close_to_tray)  # the close button keeps the app running
+        if self._tray is not None or IS_LINUX:
+            # The close button hides the window and keeps the app running. Linux has no tray icon, so start the
+            # app again to show the window.
+            self.protocol("WM_DELETE_WINDOW", self._close_to_tray)
         else:
             self.protocol("WM_DELETE_WINDOW", self._quit)  # no tray icon: closing quits, as before
         start_show_server(lambda: self._events.put("show"))
@@ -2207,9 +2365,22 @@ class JoyCon2App(tk.Tk):
             self.status_var.set(msg)
 
     def _pill(self, text, bg, fg):
+        if getattr(self, "_last_pill", None) == (text, bg, fg):
+            return  # the refresh runs often, so the label is only changed when its text changes
+        self._last_pill = (text, bg, fg)
         self.virtual_pill.config(text=text, bg=bg, fg=fg)
 
     def _refresh_virtual_pill(self):
+        if IS_LINUX:
+            if self.manager.deck_connected():
+                self._pill("Virtual controller: off (Deck connected)", SECONDARY_CONTAINER, ON_SECONDARY_CONTAINER)
+            elif self.manager.uhid_pad is not None:
+                self._pill("Virtual controller: DualShock 4 READY", GOOD_CONTAINER, ON_GOOD_CONTAINER)
+            elif self.manager.local_pad_message:
+                self._pill(f"Virtual controller: {self.manager.local_pad_message}", ERROR_CONTAINER, ON_ERROR_CONTAINER)
+            else:
+                self._pill("Virtual controller: starting", WARN_CONTAINER, ON_WARN_CONTAINER)
+            return
         if HAS_VGAMEPAD and vigembus_installed():
             if self.manager.deck_connected():
                 # The Deck has the controller, so this PC does not use it
@@ -2337,8 +2508,9 @@ class JoyCon2App(tk.Tk):
                  style="filled", bg=BG).pack(side="left")
         M3Button(actions, "Zero sticks & gyro", self._calibrate_all, style="tonal", bg=BG).pack(side="left", padx=8)
         M3Button(actions, "Disconnect all", self.manager.disconnect_all, style="danger", bg=BG).pack(side="left")
-        self.install_btn = M3Button(actions, "Install ViGEmBus driver", self._install_vigembus,
-                                    style="tonal", bg=BG)
+        if IS_WINDOWS:
+            self.install_btn = M3Button(actions, "Install ViGEmBus driver", self._install_vigembus,
+                                        style="tonal", bg=BG)
         cards = tk.Frame(page, bg=BG)
         cards.pack(fill="both", expand=True)
         cards.grid_columnconfigure(0, weight=1, uniform="cards")
@@ -2473,11 +2645,16 @@ class JoyCon2App(tk.Tk):
         ob2 = output.body
         tk.Label(ob2, text="Virtual controller output", font=(FONT, 12, "bold"), fg=TEXT,
                  bg=SURFACE).pack(anchor="w")
-        tk.Label(ob2, text="DualShock 4 is what Steam sees. Xbox 360 suits games that expect it.",
-                 font=(FONT, 9), fg=MUTED, bg=SURFACE, justify="left", wraplength=400).pack(anchor="w", pady=(2, 10))
-        self.output_var = tk.StringVar(value=OUTPUT_LABELS[self.manager.output])
-        M3Segmented(ob2, list(OUTPUT_LABELS.values()), self.output_var, command=self._set_output,
-                    width=400, bg=SURFACE).pack(anchor="w")
+        if IS_LINUX:
+            tk.Label(ob2, text="Steam and games see this PC's controller as a DualShock 4, through /dev/uhid.",
+                     font=(FONT, 9), fg=MUTED, bg=SURFACE, justify="left", wraplength=400).pack(anchor="w", pady=(2, 10))
+            self.output_var = tk.StringVar(value=OUTPUT_LABELS["ds4"])
+        else:
+            tk.Label(ob2, text="DualShock 4 is what Steam sees. Xbox 360 suits games that expect it.",
+                     font=(FONT, 9), fg=MUTED, bg=SURFACE, justify="left", wraplength=400).pack(anchor="w", pady=(2, 10))
+            self.output_var = tk.StringVar(value=OUTPUT_LABELS[self.manager.output])
+            M3Segmented(ob2, list(OUTPUT_LABELS.values()), self.output_var, command=self._set_output,
+                        width=400, bg=SURFACE).pack(anchor="w")
 
         sound = Card(right, bg=BG, fill=SURFACE)
         sound.pack(fill="x", pady=(14, 0))
@@ -2505,9 +2682,14 @@ class JoyCon2App(tk.Tk):
         self.update_btn = M3Button(ab, "Check for updates", lambda: self._start_update_check(manual=True),
                                    style="outlined", bg=SURFACE)
         self.update_btn.pack(anchor="w")
-        tk.Label(ab, text="Closing the window keeps the app running in the notification area. "
-                          "Right-click its icon to quit.",
-                 font=(FONT, 8), fg=MUTED, bg=SURFACE, justify="left", wraplength=380).pack(anchor="w", pady=(10, 0))
+        if IS_WINDOWS:
+            about_text = ("Closing the window keeps the app running in the notification area. "
+                          "Right-click its icon to quit.")
+        else:
+            about_text = ("Closing the window keeps the app running in the background, so the Joy-Cons stay connected. "
+                          "Start Joy-Con 2 Studio again to show the window. Quit stops the app.")
+        tk.Label(ab, text=about_text, font=(FONT, 8), fg=MUTED, bg=SURFACE, justify="left",
+                 wraplength=380).pack(anchor="w", pady=(10, 0))
         M3Button(ab, "Quit", self._quit, style="danger", bg=SURFACE).pack(anchor="w", pady=(8, 0))
 
     # ---- actions --------------------------------------------------------------------
@@ -2651,6 +2833,8 @@ class JoyCon2App(tk.Tk):
         mx, my = driver.mouse_raw
         self.mouse_raw_lbl.config(text=f"raw  X {mx:6d}  Y {my:6d}")
         self._show_link_state()
+        if IS_LINUX:
+            self._refresh_virtual_pill()  # the uhid device appears after start, so keep the label current
         if getattr(self, "_tick_job", None) is not None:
             self.after_cancel(self._tick_job)  # only one refresh is ever waiting
         self._tick_job = self.after(33, self._tick)

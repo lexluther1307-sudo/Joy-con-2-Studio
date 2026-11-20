@@ -21,7 +21,7 @@ if [ "$(id -u)" -eq 0 ]; then
 fi
 
 step "Checking the plugin files next to this script ($SRC)"
-for needed in plugin.json main.py joycon2_link.py dist; do
+for needed in plugin.json main.py joycon2_link.py uhid_pad.py updater.py dist; do
     if [ ! -e "$SRC/$needed" ]; then
         echo "Missing $needed next to this script. Run it from inside the joycon2studio folder." >&2
         exit 1
@@ -43,7 +43,7 @@ fi
 
 step "Copying the plugin files"
 sudo mkdir -p "$DEST"
-for item in plugin.json main.py joycon2_link.py package.json README.md LICENSE dist; do
+for item in plugin.json main.py joycon2_link.py uhid_pad.py updater.py package.json README.md LICENSE dist; do
     if [ -e "$SRC/$item" ]; then
         sudo cp -rv "$SRC/$item" "$DEST/"
     fi

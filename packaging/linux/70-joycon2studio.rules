@@ -1,0 +1,4 @@
+# Joy-Con 2 Studio: lets the user who is logged in at the desktop create the virtual gamepad (/dev/uhid)
+# and the virtual mouse (/dev/uinput) without root. systemd-logind grants that access (TAG+="uaccess").
+KERNEL=="uhid", TAG+="uaccess"
+KERNEL=="uinput", TAG+="uaccess"
