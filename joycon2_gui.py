@@ -1,6 +1,7 @@
 import asyncio
 import collections
 import ctypes
+import hashlib
 import json
 import os
 import queue
@@ -18,6 +19,7 @@ import urllib.request
 import webbrowser
 from tkinter import colorchooser
 from tkinter import font as tkfont
+from tkinter import messagebox
 from bleak import BleakClient, BleakScanner
 
 IS_WINDOWS = sys.platform == "win32"
@@ -1672,6 +1674,22 @@ class M3Menu(tk.Canvas):
         self.create_polygon(x - 6, h // 2 - 3, x + 6, h // 2 - 3, x, h // 2 + 4, fill=MUTED, outline="")
 
 
+class ScrollPage(tk.Frame):
+    """A page that scrolls: its content goes in .body. The window's mouse-wheel handler scrolls the page under the pointer."""
+
+    def __init__(self, parent, bg: str):
+        super().__init__(parent, bg=bg)
+        self.canvas = tk.Canvas(self, bg=bg, highlightthickness=0, bd=0)
+        bar = tk.Scrollbar(self, orient="vertical", command=self.canvas.yview)
+        self.body = tk.Frame(self.canvas, bg=bg)
+        inner = self.canvas.create_window(0, 0, window=self.body, anchor="nw")
+        self.canvas.configure(yscrollcommand=bar.set)
+        bar.pack(side="right", fill="y")
+        self.canvas.pack(side="left", fill="both", expand=True)
+        self.body.bind("<Configure>", lambda _e: self.canvas.configure(scrollregion=self.canvas.bbox("all")))
+        self.canvas.bind("<Configure>", lambda e: self.canvas.itemconfigure(inner, width=e.width))
+
+
 class NavItem(tk.Canvas):
     """One page button in the left rail. A pill sits behind the label when it is the current page."""
 
@@ -2113,7 +2131,7 @@ def install_vigembus_driver(log, progress) -> bool:
 
 # --- Update check: asks GitHub for the newest release ---------------------------
 
-APP_VERSION = "0.2.14"
+APP_VERSION = "0.2.16"
 UPDATE_API = "https://api.github.com/repos/lexluther1307-sudo/Joy-con-2-Studio/releases/latest"
 RELEASES_PAGE = "https://github.com/lexluther1307-sudo/Joy-con-2-Studio/releases/latest"
 
@@ -2126,8 +2144,23 @@ def version_tuple(text: str):
     return None
 
 
-def check_for_update() -> tuple[bool, str, str]:
-    """(a newer release exists, its tag, its page URL). Raises if GitHub cannot be reached."""
+UPDATE_DOWNLOAD_PREFIX = "https://github.com/lexluther1307-sudo/Joy-con-2-Studio/releases/download/"
+UPDATE_EXE_NAME = "JoyCon2Studio.exe"
+UPDATE_SUMS_NAME = "SHA256SUMS.txt"
+
+
+def can_install_in_app() -> bool:
+    """The in-app install replaces the running exe, so it is offered only for the built app on Windows."""
+    return IS_WINDOWS and bool(getattr(sys, "frozen", False))
+
+
+def current_exe() -> str:
+    return os.path.abspath(sys.executable)
+
+
+def check_for_update() -> tuple:
+    """(a newer release exists, its tag, its page URL, (exe address, checksum address) or None).
+    Raises if GitHub cannot be reached."""
     req = urllib.request.Request(
         UPDATE_API,
         headers={"Accept": "application/vnd.github+json", "User-Agent": "Joy-Con-2-Studio"},
@@ -2137,12 +2170,88 @@ def check_for_update() -> tuple[bool, str, str]:
     latest = release.get("tag_name", "")
     latest_v = version_tuple(latest)
     newer = latest_v is not None and latest_v > version_tuple(APP_VERSION)
-    return newer, latest, release.get("html_url") or RELEASES_PAGE
+    return newer, latest, release.get("html_url") or RELEASES_PAGE, update_assets(release)
+
+
+def update_assets(release: dict):
+    """(exe address, checksum address) of a release, or None when it lacks either file.
+    Only addresses on the project's own GitHub release downloads are accepted."""
+    assets = {a.get("name"): a.get("browser_download_url", "") for a in release.get("assets", [])}
+    exe, sums = assets.get(UPDATE_EXE_NAME, ""), assets.get(UPDATE_SUMS_NAME, "")
+    if not exe or not sums:
+        return None
+    if not (exe.startswith(UPDATE_DOWNLOAD_PREFIX) and sums.startswith(UPDATE_DOWNLOAD_PREFIX)):
+        return None
+    return exe, sums
+
+
+def download_update(url: str, dest: str, progress=None) -> None:
+    """Saves the file at url to dest, reporting the fraction done. Stops if it grows past 80 MB."""
+    req = urllib.request.Request(url, headers={"User-Agent": "Joy-Con-2-Studio"})
+    with urllib.request.urlopen(req, timeout=60) as resp, open(dest, "wb") as out:
+        total = int(resp.headers.get("Content-Length") or 0)
+        done = 0
+        while True:
+            chunk = resp.read(64 * 1024)
+            if not chunk:
+                break
+            done += len(chunk)
+            if done > 80 * 1024 * 1024:
+                raise RuntimeError("the download is larger than expected")
+            out.write(chunk)
+            if progress and total:
+                progress(done / total)
+
+
+def verify_download(path: str, sums_text: str) -> bool:
+    """True when the file's SHA-256 is the one that SHA256SUMS.txt lists for JoyCon2Studio.exe."""
+    expected = None
+    for line in sums_text.splitlines():
+        parts = line.split()
+        if len(parts) == 2 and parts[1].lstrip("*") == UPDATE_EXE_NAME:
+            expected = parts[0].lower()
+    if expected is None:
+        return False
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(1 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest() == expected
+
+
+def update_helper_script(current: str, new: str, previous: str, pid: int, log: str) -> str:
+    """A batch file that waits for the running app to close, puts the new exe in its place, starts it and
+    deletes itself. The old exe is kept as the .previous copy."""
+    lines = [
+        "@echo off",
+        f'set "CURRENT={current}"',
+        f'set "NEW={new}"',
+        f'set "PREVIOUS={previous}"',
+        f'set "LOG={log}"',
+        f"set PID={pid}",
+        ":wait",
+        'tasklist /FI "PID eq %PID%" /NH 2>nul | find "%PID%" >nul',
+        "if not errorlevel 1 (ping -n 2 127.0.0.1 >nul & goto wait)",
+        "set TRIES=0",
+        ":swap",
+        'copy /Y "%CURRENT%" "%PREVIOUS%" >nul 2>nul',
+        'move /Y "%NEW%" "%CURRENT%" >nul 2>nul',
+        "if not errorlevel 1 goto started",
+        "set /a TRIES+=1",
+        "if %TRIES% lss 30 (ping -n 2 127.0.0.1 >nul & goto swap)",
+        'echo %date% %time% could not replace the app >> "%LOG%"',
+        "exit /b 1",
+        ":started",
+        'echo %date% %time% installed the update, starting it >> "%LOG%"',
+        'start "" "%CURRENT%"',
+        '(goto) 2>nul & del "%~f0" >nul 2>nul',
+    ]
+    return "\r\n".join(lines) + "\r\n"
 
 
 # --- Keeping the app running: a tray icon, and a second copy that shows the running window ------------
 
-SHOW_PORT = 26790  # a second copy connects here, asks the running copy to show its window, and exits
+SHOW_PORT = int(os.environ.get("JOYCON2STUDIO_SHOW_PORT", "26790"))  # a second copy connects here and asks the running copy to show; the variable is for tests
 TRAY_CLASS = "JoyCon2StudioTray"
 WM_APP = 0x8000
 WM_TRAY = WM_APP + 1  # the tray icon sends this to our hidden window when it is clicked
@@ -2471,23 +2580,81 @@ class JoyCon2App(tk.Tk):
         # The setting "check_updates" switches the check at startup off; the button still checks.
         if not manual and not load_settings().get("check_updates", True):
             return
+
         def worker():
             try:
-                newer, latest, url = check_for_update()
+                newer, latest, url, assets = check_for_update()
             except Exception as e:
                 if manual:
                     self._set_status(f"Could not check for updates: {e}")
                 return
-            if newer:
-                self.after(0, lambda: self._update_found(latest, url))
-            elif manual:
-                self._set_status(f"You have the latest version ({APP_VERSION}).")
+            if not newer:
+                if manual:
+                    self._set_status(f"You have the latest version ({APP_VERSION}).")
+                return
+            self.after(0, lambda: self._update_found(latest, url, assets))
+            # Installing by itself happens at startup, before the Joy-Cons are in use, and only if the setting asks
+            if not manual and assets and can_install_in_app() and load_settings().get("install_updates", False):
+                self.after(0, lambda: self._install_update(latest, assets))
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def _update_found(self, latest: str, url: str):
-        self.update_btn.config(text=f"Get {latest}", command=lambda: webbrowser.open(url))
-        self._set_status(f"Update available: {latest} (you have {APP_VERSION}). Use the Get {latest} button.")
+    def _update_found(self, latest: str, url: str, assets):
+        if assets and can_install_in_app():
+            self.update_btn.config(text=f"Install {latest}",
+                                   command=lambda: self._confirm_install(latest, assets))
+            self._set_status(f"Version {latest} is available. Press Install {latest} to update the app.")
+        else:
+            self.update_btn.config(text=f"Get {latest}", command=lambda: webbrowser.open(url))
+            self._set_status(f"Update available: {latest} (you have {APP_VERSION}). Use the Get {latest} button.")
+
+    def _confirm_install(self, latest: str, assets):
+        if messagebox.askyesno(
+            "Install update",
+            f"Install version {latest} now?\n\nThe app downloads it, checks the download, and restarts. "
+            "The Joy-Cons disconnect while it restarts, so press SYNC on them again once it is running.",
+            parent=self,
+        ):
+            self._install_update(latest, assets)
+
+    def _install_update(self, latest: str, assets):
+        exe_url, sums_url = assets
+        target = current_exe()
+        folder = os.path.dirname(target)
+        new_path = os.path.join(folder, "JoyCon2Studio.new.exe")
+        previous_path = os.path.join(folder, "JoyCon2Studio.previous.exe")
+        self.update_btn.config(text="Installing...", command=lambda: None)
+
+        def worker():
+            try:
+                self._set_status(f"Downloading version {latest}...")
+                download_update(exe_url, new_path, progress=lambda f: self._set_status(
+                    f"Downloading version {latest}... {round(f * 100)}%"))
+                with urllib.request.urlopen(sums_url, timeout=30) as resp:
+                    sums = resp.read(64 * 1024).decode("utf-8", "replace")
+                if not verify_download(new_path, sums):
+                    raise RuntimeError("the download does not match SHA256SUMS.txt")
+                temp = tempfile.gettempdir()
+                script = os.path.join(temp, "joycon2studio-update.cmd")
+                log = os.path.join(temp, "joycon2studio-update.log")
+                with open(script, "w", encoding="mbcs", newline="") as handle:
+                    handle.write(update_helper_script(target, new_path, previous_path, os.getpid(), log))
+                # The helper runs on its own after this app closes, so it keeps going when the app has quit.
+                # Not DETACHED_PROCESS: with it the helper never ran (tested). CREATE_NO_WINDOW alone works.
+                subprocess.Popen(["cmd.exe", "/c", script], creationflags=0x08000000 | 0x00000200, close_fds=True)
+            except Exception as e:
+                try:
+                    os.remove(new_path)
+                except OSError:
+                    pass
+                self.after(0, lambda: self.update_btn.config(
+                    text=f"Install {latest}", command=lambda: self._confirm_install(latest, assets)))
+                self._set_status(f"Update to {latest} failed: {e}. The installed version was kept.")
+                return
+            self._set_status(f"Installing version {latest}. The app restarts now.")
+            self.after(0, self._quit)
+
+        threading.Thread(target=worker, daemon=True).start()
 
     # ---- layout ---------------------------------------------------------------------
 
@@ -2518,9 +2685,29 @@ class JoyCon2App(tk.Tk):
         self._build_controllers_page()
         self._build_deck_page()
         self._build_settings_page()
+        for sequence in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+            self.bind_all(sequence, self._on_wheel)  # one handler scrolls whichever page the pointer is over
         self._show_page("controllers")
         if self.bridge_var.get():
             self._toggle_bridge()  # connects with the saved address and code
+
+    def _on_wheel(self, event):
+        """Scrolls the ScrollPage under the pointer: the Windows wheel, or buttons 4 and 5 on Linux."""
+        try:
+            widget = self.winfo_containing(event.x_root, event.y_root)
+        except (KeyError, tk.TclError):
+            return
+        while widget is not None and not isinstance(widget, ScrollPage):
+            widget = widget.master
+        if widget is None:
+            return
+        if event.num == 4:
+            step = -1
+        elif event.num == 5:
+            step = 1
+        else:
+            step = -1 if event.delta > 0 else 1
+        widget.canvas.yview_scroll(step, "units")
 
     def _show_page(self, name: str):
         for key, page in self.pages.items():
@@ -2567,14 +2754,14 @@ class JoyCon2App(tk.Tk):
         return row
 
     def _build_deck_page(self):
-        page = tk.Frame(self.page_area, bg=BG)
+        page = ScrollPage(self.page_area, bg=BG)
         self.pages["deck"] = page
         bridge = load_settings()
         self.bridge_var = tk.BooleanVar(value=bool(bridge.get("bridge_on", False)))
         self.bridge_ip_var = tk.StringVar(value=bridge.get("bridge_ip", ""))
         self.deck_code_var = tk.StringVar(value=bridge.get("deck_code", ""))
 
-        card = Card(page, bg=BG, fill=SURFACE)
+        card = Card(page.body, bg=BG, fill=SURFACE)
         card.pack(fill="x", anchor="n")
         b = card.body
         tk.Label(b, text="Use this PC's Joy-Cons on a Steam Deck", font=(FONT, 14, "bold"),
@@ -2605,7 +2792,7 @@ class JoyCon2App(tk.Tk):
         self.link_lbl = tk.Label(buttons, text="Deck: off", font=(FONT, 10), fg=MUTED, bg=SURFACE)
         self.link_lbl.pack(side="left", padx=(12, 0))
 
-        steps = Card(page, bg=BG, fill=SURFACE)
+        steps = Card(page.body, bg=BG, fill=SURFACE)
         steps.pack(fill="x", anchor="n", pady=(14, 0))
         sb = steps.body
         tk.Label(sb, text="How to connect", font=(FONT, 12, "bold"), fg=TEXT, bg=SURFACE).pack(anchor="w")
@@ -2619,9 +2806,9 @@ class JoyCon2App(tk.Tk):
                      wraplength=760).pack(anchor="w", pady=(6, 0))
 
     def _build_settings_page(self):
-        page = tk.Frame(self.page_area, bg=BG)
+        page = ScrollPage(self.page_area, bg=BG)
         self.pages["settings"] = page
-        cols = tk.Frame(page, bg=BG)
+        cols = tk.Frame(page.body, bg=BG)
         cols.pack(fill="both", expand=True)
         cols.grid_columnconfigure(0, weight=1, uniform="cols")
         cols.grid_columnconfigure(1, weight=1, uniform="cols")
@@ -2656,7 +2843,7 @@ class JoyCon2App(tk.Tk):
                          self._toggle_auto_mode)
         tk.Label(ob, text="Slide a Joy-Con on a surface to use it as a mouse. Press its sticks or buttons "
                           "to use it as a controller again.",
-                 font=(FONT, 8), fg=MUTED, bg=SURFACE, justify="left", wraplength=380).pack(
+                 font=(FONT, 8), fg=MUTED, bg=SURFACE, justify="left", wraplength=300, anchor="w").pack(
             anchor="w", padx=(64, 0), pady=(2, 0))
         speed = tk.Frame(ob, bg=SURFACE)
         speed.pack(anchor="w", pady=(10, 0))
@@ -2735,6 +2922,10 @@ class JoyCon2App(tk.Tk):
         self.check_updates_var = tk.BooleanVar(value=load_settings().get("check_updates", True))
         self._switch_row(ab, "Check for updates when the app starts", self.check_updates_var,
                          self._toggle_check_updates)
+        if can_install_in_app():
+            self.install_updates_var = tk.BooleanVar(value=load_settings().get("install_updates", False))
+            self._switch_row(ab, "Install updates by itself when the app starts", self.install_updates_var,
+                             self._toggle_install_updates)
         if IS_WINDOWS:
             about_text = ("Closing the window keeps the app running in the notification area. "
                           "Right-click its icon to quit.")
@@ -2759,6 +2950,11 @@ class JoyCon2App(tk.Tk):
     def _toggle_check_updates(self):
         settings = load_settings()
         settings["check_updates"] = self.check_updates_var.get()
+        save_settings(settings)
+
+    def _toggle_install_updates(self):
+        settings = load_settings()
+        settings["install_updates"] = self.install_updates_var.get()
         save_settings(settings)
 
     def _toggle_glass(self):
