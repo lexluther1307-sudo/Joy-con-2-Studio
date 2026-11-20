@@ -3,6 +3,7 @@ import collections
 import ctypes
 import json
 import os
+import re
 import shutil
 import socket
 import struct
@@ -1198,6 +1199,25 @@ def vigembus_installed() -> bool:
         return False
 
 
+def vigembus_running() -> bool:
+    """True when the ViGEmBus service is running, so the virtual controller can be created."""
+    try:
+        run = subprocess.run(
+            ["sc", "query", "ViGEmBus"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=15,
+            creationflags=NO_WINDOW,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    out = run.stdout or ""
+    state = re.search(r"STATE\s*:\s*(\d+)", out)
+    return "RUNNING" in out or (state is not None and state.group(1) == "4")
+
+
 def find_vigembus_installer() -> tuple[str, str]:
     """(file name, download URL) of the installer in the latest official ViGEmBus release."""
     req = urllib.request.Request(
@@ -1252,7 +1272,8 @@ def download_file(url: str, dest: str, progress) -> None:
 def run_as_admin(path: str) -> None:
     """Runs the installer elevated. Windows shows the UAC prompt first; raises if it is declined or fails."""
     quoted = path.replace("'", "''")
-    script = f"Start-Process -FilePath '{quoted}' -Verb RunAs -Wait"
+    # /norestart: the driver install must never restart the PC by itself
+    script = f"Start-Process -FilePath '{quoted}' -ArgumentList '/norestart' -Verb RunAs -Wait"
     run = subprocess.run(
         ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", script],
         capture_output=True,
@@ -1286,7 +1307,7 @@ def install_vigembus_driver(log, progress) -> bool:
 
 # --- Update check: asks GitHub for the newest release ---------------------------
 
-APP_VERSION = "0.1.1"
+APP_VERSION = "0.2.0"
 UPDATE_API = "https://api.github.com/repos/lexluther1307-sudo/Joy-con-2-Studio/releases/latest"
 RELEASES_PAGE = "https://github.com/lexluther1307-sudo/Joy-con-2-Studio/releases/latest"
 
@@ -1340,7 +1361,11 @@ class JoyCon2App(tk.Tk):
 
     def _refresh_virtual_pill(self):
         if HAS_VGAMEPAD and vigembus_installed():
-            self.virtual_pill.config(text="Virtual controller: READY", fg=GOOD, bg=GOOD_BG)
+            if vigembus_running():
+                self.virtual_pill.config(text="Virtual controller: READY", fg=GOOD, bg=GOOD_BG)
+            else:
+                # Installed but not active yet. A restart finishes it, but nothing requires one.
+                self.virtual_pill.config(text="Virtual controller: restart suggested", fg=WARN, bg=SURFACE_2)
             self.install_btn.pack_forget()
         else:
             self.virtual_pill.config(text="Virtual controller: MISSING ViGEmBus", fg=WARN, bg=SURFACE_2)
@@ -1358,11 +1383,16 @@ class JoyCon2App(tk.Tk):
                     self._set_status,
                     lambda pct: self._set_status(f"Downloading the ViGEmBus driver... {pct}%"),
                 )
-                msg = (
-                    "ViGEmBus driver installed. The virtual controller is ready."
-                    if ok
-                    else "The installer finished, but the driver is not registered. Try again, or restart the PC."
-                )
+                if not ok:
+                    msg = "The installer finished, but the driver is not registered. Try again. A restart may help."
+                elif vigembus_running():
+                    msg = "ViGEmBus driver installed and running. The virtual controller is ready."
+                else:
+                    # Suggested, never required: the Joy-Cons still work without the virtual controller
+                    msg = (
+                        "ViGEmBus is installed but not running yet. Restarting the PC usually finishes it. "
+                        "It is optional; the Joy-Cons work meanwhile."
+                    )
             except Exception as e:
                 ok = False
                 msg = f"ViGEmBus install failed: {e}. You can install it by hand from {VIGEMBUS_PAGE}"

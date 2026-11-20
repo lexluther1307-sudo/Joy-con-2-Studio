@@ -13,6 +13,8 @@ node_modules/
 
 # Local settings and device data
 /settings.json
+/tools/deck-config.json
+/tools/deck-activity.log
 /spi_backup/
 *.bin
 *.log

@@ -1,35 +1,23 @@
 # Joy-Con 2 Studio (Decky Loader plugin)
 
-Connects Joy-Con 2 controllers to the Steam Deck and presents them to Steam as a virtual
-DualShock 4: buttons, sticks, gyro, accelerometer and rumble. Steam's rumble plays on the Joy-Cons.
+Shows Joy-Con 2 controllers to Steam on the Steam Deck. The Joy-Cons stay connected to the Windows PC. The PC sends their state to this plugin over Wi-Fi, and the plugin presents it to Steam as a virtual DualShock 4. Steam's rumble goes back to the PC and plays on the Joy-Cons.
 
-Status: the network bridge (below) was tested on a Deck. Direct Joy-Con pairing on the Deck does not work yet, so use the bridge. Send back logs if something fails.
+Version 0.2.0. The plugin uses only the network. It does not use Bluetooth.
 
 ## Install on the Steam Deck
 
 1. Install Decky Loader first.
 2. Put this folder on the Deck, or unzip the release zip (it contains a `joycon2studio` folder).
 3. In Konsole (Desktop Mode), go into that folder and run `bash install.sh`. It asks for your sudo password, installs the plugin to `~/homebrew/plugins/joycon2studio` and restarts the plugin loader.
-4. Open the Quick Access menu, pick Joy-Con 2 Studio.
+4. Open the Quick Access menu and pick Joy-Con 2 Studio.
 
-## Test (direct Joy-Con connection)
+## Use it
 
-1. The status line should say "Virtual DualShock 4: ready".
-2. Hold SYNC on each Joy-Con, then press "Scan for Joy-Cons". Each side should show connected with a battery level.
-3. Press "Test rumble (right)" and "(left)". Try a song.
-4. In Steam (Settings > Controller), check that the "Wireless Controller" shows up. Its Controller Test should respond to the sticks and gyro.
-5. Steam's rumble test or a game with rumble should buzz the Joy-Cons.
+1. On the PC, run the Windows app, connect the Joy-Cons, tick "Send controller to a Deck (network bridge)" and type this Deck's address. The plugin shows the address under "This Deck".
+2. On the Deck, press **Scan network**. It listens for 5 seconds and shows the PC when the PC is sending.
+3. Steam shows the controller as a Wireless Controller. Its Controller Test should respond to the sticks and buttons.
 
-## Network bridge (Joy-Cons stay on the PC)
-
-Direct pairing on the Deck fails, so the PC keeps the Joy-Cons and streams their state here over
-UDP port 26761. The Deck's firewall allows that port by default.
-
-1. Install the plugin as above and reboot the Deck.
-2. On the PC, run `JoyCon2Studio.exe`, connect the Joy-Cons, tick "Send controller to a Deck (network bridge)" and type the Deck's IP.
-3. The Deck shows the same virtual DualShock 4 in Steam. Steam's rumble goes back to the PC and buzzes the Joy-Cons.
-
-If the PC stops sending for half a second, the Deck falls back to its own Joy-Cons.
+The bridge uses UDP port 26761. It is not encrypted or authenticated, so use it only on a network you trust. If the PC stops sending for half a second, the plugin shows the controller at rest until the PC sends again.
 
 ## If something fails
 
@@ -41,8 +29,7 @@ Send that output back, along with what the status line says.
 
 ## Known limits
 
-- Steam sees a DualShock 4, not a Joy-Con. Making Steam list the devices as Joy-Cons is a separate job.
-- The mouse feature is not included.
-- Gyro scale is a first guess. Tune the calibration values in `main.py` if the gyro runs too fast or slow.
+- Steam sees a DualShock 4, not a Joy-Con.
+- The Deck does not pair with the Joy-Cons over Bluetooth. Connect them to the PC.
+- Gyro and accelerometer scaling are first guesses.
 - Needs `/dev/uhid` (present on SteamOS). The plugin runs as root through the `root` flag in `plugin.json`.
-- The Bluetooth parts assume the Deck's Python is 3.11 (the bundled `py_modules` are cp311 Linux builds).

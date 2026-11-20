@@ -78,23 +78,12 @@ function IconBase(props) {
 }
 
 // THIS FILE IS AUTO GENERATED
-function FaGamepad (props) {
-  return GenIcon({"attr":{"viewBox":"0 0 640 512"},"child":[{"tag":"path","attr":{"d":"M480.07 96H160a160 160 0 1 0 114.24 272h91.52A160 160 0 1 0 480.07 96zM248 268a12 12 0 0 1-12 12h-52v52a12 12 0 0 1-12 12h-24a12 12 0 0 1-12-12v-52H84a12 12 0 0 1-12-12v-24a12 12 0 0 1 12-12h52v-52a12 12 0 0 1 12-12h24a12 12 0 0 1 12 12v52h52a12 12 0 0 1 12 12zm216 76a40 40 0 1 1 40-40 40 40 0 0 1-40 40zm64-96a40 40 0 1 1 40-40 40 40 0 0 1-40 40z"},"child":[]}]})(props);
+function FaWifi (props) {
+  return GenIcon({"attr":{"viewBox":"0 0 640 512"},"child":[{"tag":"path","attr":{"d":"M634.91 154.88C457.74-8.99 182.19-8.93 5.09 154.88c-6.66 6.16-6.79 16.59-.35 22.98l34.24 33.97c6.14 6.1 16.02 6.23 22.4.38 145.92-133.68 371.3-133.71 517.25 0 6.38 5.85 16.26 5.71 22.4-.38l34.24-33.97c6.43-6.39 6.3-16.82-.36-22.98zM320 352c-35.35 0-64 28.65-64 64s28.65 64 64 64 64-28.65 64-64-28.65-64-64-64zm202.67-83.59c-115.26-101.93-290.21-101.82-405.34 0-6.9 6.1-7.12 16.69-.57 23.15l34.44 33.99c6 5.92 15.66 6.32 22.05.8 83.95-72.57 209.74-72.41 293.49 0 6.39 5.52 16.05 5.13 22.05-.8l34.44-33.99c6.56-6.46 6.33-17.06-.56-23.15z"},"child":[]}]})(props);
 }
 
 const getStatus = callable("status");
-const startScan = callable("scan");
-const disconnectAll = callable("disconnect_all");
-const calibrate = callable("calibrate");
-const testRumble = callable("test_rumble");
-const playSong = callable("play_song");
-const stopVibration = callable("stop_vibration");
-function sideLine(label, s) {
-    if (!s || !s.connected)
-        return `${label}: waiting`;
-    const power = s.charging ? "charging" : "battery";
-    return `${label}: connected, ${power} ${s.battery ?? 0}%`;
-}
+const scanNetwork = callable("scan");
 const Content = () => {
     const [status, setStatus] = SP_REACT.useState(null);
     const [error, setError] = SP_REACT.useState("");
@@ -123,44 +112,26 @@ const Content = () => {
     if (!status) {
         return (SP_REACT.createElement(DFL.PanelSection, { title: "Status" },
             SP_REACT.createElement(DFL.PanelSectionRow, null,
-                SP_REACT.createElement("div", null, error ? `Backend error: ${error}` : "Starting the plugin..."))));
+                SP_REACT.createElement("div", null, error ? `Backend error: ${error}` : "Starting..."))));
     }
     return (SP_REACT.createElement(SP_REACT.Fragment, null,
         SP_REACT.createElement(DFL.PanelSection, { title: "Status" },
             SP_REACT.createElement(DFL.PanelSectionRow, null,
+                SP_REACT.createElement("div", null, `Version ${status.version}`)),
+            SP_REACT.createElement(DFL.PanelSectionRow, null,
                 SP_REACT.createElement("div", null, status.pad_ok ? "Virtual DualShock 4: ready" : `Virtual controller: ${status.pad_message}`)),
             SP_REACT.createElement(DFL.PanelSectionRow, null,
-                SP_REACT.createElement("div", null, sideLine("Left", status.left))),
+                SP_REACT.createElement("div", null, status.pc_connected
+                    ? `PC connected: ${status.pc_address} (${status.packets_per_second} packets/s)`
+                    : "Waiting for the PC on Wi-Fi")),
             SP_REACT.createElement(DFL.PanelSectionRow, null,
-                SP_REACT.createElement("div", null, sideLine("Right", status.right))),
+                SP_REACT.createElement("div", null, `This Deck: ${status.deck_address || "address unknown"}, UDP port ${status.port}`)),
             SP_REACT.createElement(DFL.PanelSectionRow, null,
                 SP_REACT.createElement("div", null, status.message))),
-        SP_REACT.createElement(DFL.PanelSection, { title: "Joy-Cons" },
+        SP_REACT.createElement(DFL.PanelSection, { title: "Network" },
             SP_REACT.createElement(DFL.PanelSectionRow, null,
-                SP_REACT.createElement(DFL.ButtonItem, { layout: "below", onClick: () => startScan() }, "Scan for Joy-Cons")),
-            SP_REACT.createElement(DFL.PanelSectionRow, null,
-                SP_REACT.createElement(DFL.ButtonItem, { layout: "below", onClick: () => calibrate() }, "Zero sticks and gyro")),
-            SP_REACT.createElement(DFL.PanelSectionRow, null,
-                SP_REACT.createElement(DFL.ButtonItem, { layout: "below", onClick: () => disconnectAll() }, "Disconnect all"))),
-        SP_REACT.createElement(DFL.PanelSection, { title: "Rumble" },
-            SP_REACT.createElement(DFL.PanelSectionRow, null,
-                SP_REACT.createElement(DFL.ButtonItem, { layout: "below", onClick: () => testRumble("R") }, "Test rumble (right)")),
-            SP_REACT.createElement(DFL.PanelSectionRow, null,
-                SP_REACT.createElement(DFL.ButtonItem, { layout: "below", onClick: () => testRumble("L") }, "Test rumble (left)")),
-            SP_REACT.createElement(DFL.PanelSectionRow, null,
-                SP_REACT.createElement(DFL.ButtonItem, { layout: "below", onClick: () => stopVibration() }, "Stop vibration"))),
-        SP_REACT.createElement(DFL.PanelSection, { title: "Songs" }, (status.songs ?? []).map((name, index) => (SP_REACT.createElement(DFL.PanelSectionRow, { key: name },
-            SP_REACT.createElement(DFL.ButtonItem, { layout: "below", onClick: () => playSong(index) }, name))))),
-        SP_REACT.createElement(DFL.PanelSection, { title: "Diagnostics" },
-            (status.diag ?? []).map((line, i) => (SP_REACT.createElement(DFL.PanelSectionRow, { key: `diag${i}` },
-                SP_REACT.createElement("div", null, line)))),
-            status.bleak_error ? (SP_REACT.createElement(DFL.PanelSectionRow, null,
-                SP_REACT.createElement("div", null, status.bleak_error))) : null,
-            (status.seen ?? []).map((line, i) => (SP_REACT.createElement(DFL.PanelSectionRow, { key: `seen${i}` },
-                SP_REACT.createElement("div", null,
-                    "Seen: ",
-                    line)))),
-            (status.recent ?? []).map((line, i) => (SP_REACT.createElement(DFL.PanelSectionRow, { key: `recent${i}` },
+                SP_REACT.createElement(DFL.ButtonItem, { layout: "below", onClick: () => scanNetwork() }, status.scanning ? "Scanning..." : "Scan network")),
+            (status.scan_result ?? []).map((line, i) => (SP_REACT.createElement(DFL.PanelSectionRow, { key: `scan${i}` },
                 SP_REACT.createElement("div", null, line)))))));
 };
 var index = definePlugin(() => {
@@ -168,7 +139,7 @@ var index = definePlugin(() => {
         name: "Joy-Con 2 Studio",
         titleView: SP_REACT.createElement("div", { className: DFL.staticClasses.Title }, "Joy-Con 2 Studio"),
         content: SP_REACT.createElement(Content, null),
-        icon: SP_REACT.createElement(FaGamepad, null),
+        icon: SP_REACT.createElement(FaWifi, null),
         onDismount() { },
     };
 });

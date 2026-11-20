@@ -13,38 +13,46 @@ PLUGINS_DIR="$HOME/homebrew/plugins"
 DEST="$PLUGINS_DIR/$PLUGIN"
 STAMP="$(date +%Y%m%d-%H%M%S)"
 
+step() { echo "==> $*"; }
+
 if [ "$(id -u)" -eq 0 ]; then
     echo "Run this as your normal user (deck), not as root. The script uses sudo itself." >&2
     exit 1
 fi
 
-for needed in plugin.json main.py dist py_modules; do
+step "Checking the plugin files next to this script ($SRC)"
+for needed in plugin.json main.py dist; do
     if [ ! -e "$SRC/$needed" ]; then
         echo "Missing $needed next to this script. Run it from inside the joycon2studio folder." >&2
         exit 1
     fi
 done
 
+step "Checking that Decky Loader is installed ($PLUGINS_DIR)"
 if [ ! -d "$PLUGINS_DIR" ]; then
     echo "Decky Loader is not installed (no $PLUGINS_DIR). Install Decky Loader first, then run this again." >&2
     exit 1
 fi
 
-echo "Installing $PLUGIN to $DEST. Enter your sudo password when asked."
-
+step "Installing $PLUGIN to $DEST (enter your sudo password when asked)"
 if [ -e "$DEST" ]; then
     BACKUP="$HOME/joycon2studio-backup-$STAMP"
-    sudo mv "$DEST" "$BACKUP"
-    echo "Previous version moved to $BACKUP"
+    step "Moving the older version to $BACKUP"
+    sudo mv -v "$DEST" "$BACKUP"
 fi
 
+step "Copying the plugin files"
 sudo mkdir -p "$DEST"
-for item in plugin.json main.py package.json README.md LICENSE dist py_modules; do
+for item in plugin.json main.py package.json README.md LICENSE dist; do
     if [ -e "$SRC/$item" ]; then
-        sudo cp -r "$SRC/$item" "$DEST/"
+        sudo cp -rv "$SRC/$item" "$DEST/"
     fi
 done
+
+step "Setting the owner of $DEST to root"
 sudo chown -R root:root "$DEST"
 
+step "Restarting plugin_loader"
 sudo systemctl restart plugin_loader
-echo "Installed. Open the Quick Access menu and pick Joy-Con 2 Studio."
+
+step "Done. Open the Quick Access menu and pick Joy-Con 2 Studio."
