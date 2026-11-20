@@ -129,6 +129,18 @@ class DownloadTests(unittest.TestCase):
         self.assertAlmostEqual(seen[-1], 1.0)
 
 
+class ChildEnvTests(unittest.TestCase):
+    def test_the_frozen_app_variables_and_its_temp_folder_are_left_out(self):
+        path = os.pathsep.join([r"C:\Windows", r"C:\Users\x\AppData\Local\Temp\_MEI123", r"C:\Tools"])
+        with mock.patch.dict(os.environ, {"_PYI_PARENT_PROCESS_LEVEL": "1", "_PYI_APPLICATION_HOME_DIR": r"C:\T\_MEI123",
+                                          "_PYI_ARCHIVE_FILE": r"C:\app.exe", "_MEIPASS2": r"C:\T\_MEI123",
+                                          "PATH": path, "KEEP_ME": "yes"}, clear=True):
+            env = g.child_env()
+        self.assertEqual(env["KEEP_ME"], "yes")
+        self.assertFalse([key for key in env if key.upper().startswith(("_PYI", "_MEIPASS"))])
+        self.assertEqual(env["PATH"], os.pathsep.join([r"C:\Windows", r"C:\Tools"]))
+
+
 class GateTests(unittest.TestCase):
     def test_the_in_app_install_is_only_offered_for_the_built_app(self):
         self.assertFalse(g.can_install_in_app())  # the tests run from source, not as the built exe

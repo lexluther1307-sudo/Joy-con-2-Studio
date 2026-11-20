@@ -2131,7 +2131,7 @@ def install_vigembus_driver(log, progress) -> bool:
 
 # --- Update check: asks GitHub for the newest release ---------------------------
 
-APP_VERSION = "0.2.16"
+APP_VERSION = "0.2.17"
 UPDATE_API = "https://api.github.com/repos/lexluther1307-sudo/Joy-con-2-Studio/releases/latest"
 RELEASES_PAGE = "https://github.com/lexluther1307-sudo/Joy-con-2-Studio/releases/latest"
 
@@ -2247,6 +2247,17 @@ def update_helper_script(current: str, new: str, previous: str, pid: int, log: s
         '(goto) 2>nul & del "%~f0" >nul 2>nul',
     ]
     return "\r\n".join(lines) + "\r\n"
+
+
+def child_env() -> dict:
+    """The environment for the update helper and the new copy. A frozen app's bootloader leaves its own variables
+    in the environment, and they name the temp folder that the app deletes when it quits. A copy started with them
+    looks for its files in that folder and fails, so those variables and the folder on PATH are left out."""
+    env = {key: value for key, value in os.environ.items() if not key.upper().startswith(("_PYI", "_MEIPASS"))}
+    for key in list(env):
+        if key.upper() == "PATH":
+            env[key] = os.pathsep.join(part for part in env[key].split(os.pathsep) if "_MEI" not in part)
+    return env
 
 
 # --- Keeping the app running: a tray icon, and a second copy that shows the running window ------------
@@ -2641,7 +2652,9 @@ class JoyCon2App(tk.Tk):
                     handle.write(update_helper_script(target, new_path, previous_path, os.getpid(), log))
                 # The helper runs on its own after this app closes, so it keeps going when the app has quit.
                 # Not DETACHED_PROCESS: with it the helper never ran (tested). CREATE_NO_WINDOW alone works.
-                subprocess.Popen(["cmd.exe", "/c", script], creationflags=0x08000000 | 0x00000200, close_fds=True)
+                # child_env() keeps the new copy from inheriting this copy's PyInstaller variables.
+                subprocess.Popen(["cmd.exe", "/c", script], creationflags=0x08000000 | 0x00000200, close_fds=True,
+                                 env=child_env())
             except Exception as e:
                 try:
                     os.remove(new_path)
