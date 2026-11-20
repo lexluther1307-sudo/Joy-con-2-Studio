@@ -6,6 +6,14 @@ The Windows app connects the Joy-Cons over Bluetooth LE and presents them to Win
 
 > **Experimental and unofficial.** Tested on Windows 11 with a left and a right Joy-Con 2. Direct Bluetooth pairing on the Steam Deck does not work yet. The network bridge to the Deck is new and has not been tested end to end with Steam.
 
+## Download
+
+[Joy-Con 2 Studio for Windows](https://github.com/lexluther1307-sudo/Joy-con-2-Studio/releases/latest): download `JoyCon2Studio.exe` from the latest release. It needs no Python, but it still needs the ViGEmBus driver (see Requirements).
+
+Before you run it:
+- Check its SHA-256 hash against the one in the release notes: `certutil -hashfile JoyCon2Studio.exe SHA256`.
+- Windows SmartScreen may warn about an unknown publisher, because the exe is not code-signed. Click More info > Run anyway only if the hash matches.
+
 ## Features
 
 Windows app (`joycon2_gui.py`):
@@ -29,6 +37,8 @@ Steam Deck plugin (`decky/joycon2studio`):
 - Nintendo Switch 2 Joy-Con 2 controllers. The original Joy-Con is not supported.
 
 ## Windows app
+
+The exe in the Download section needs no Python. To run from source:
 
 1. Install the requirements above.
 2. Run `py joycon2_gui.py` from this folder.
