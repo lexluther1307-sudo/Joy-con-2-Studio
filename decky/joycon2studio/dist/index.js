@@ -84,6 +84,16 @@ function FaWifi (props) {
 
 const getStatus = callable("status");
 const scanNetwork = callable("scan");
+const disconnectPc = callable("disconnect");
+const connectPc = callable("connect");
+const newPairingCode = callable("new_pairing_code");
+function linkLine(s) {
+    if (s.link_state === "connected")
+        return `Connected to the PC at ${s.pc_address}`;
+    if (s.link_state === "refused")
+        return "Disconnected by you. Press Connect to accept the PC again.";
+    return "Waiting for the PC. Enter this pairing code on the PC.";
+}
 const Content = () => {
     const [status, setStatus] = SP_REACT.useState(null);
     const [error, setError] = SP_REACT.useState("");
@@ -114,6 +124,7 @@ const Content = () => {
             SP_REACT.createElement(DFL.PanelSectionRow, null,
                 SP_REACT.createElement("div", null, error ? `Backend error: ${error}` : "Starting..."))));
     }
+    const refused = status.link_state === "refused";
     return (SP_REACT.createElement(SP_REACT.Fragment, null,
         SP_REACT.createElement(DFL.PanelSection, { title: "Status" },
             SP_REACT.createElement(DFL.PanelSectionRow, null,
@@ -121,13 +132,19 @@ const Content = () => {
             SP_REACT.createElement(DFL.PanelSectionRow, null,
                 SP_REACT.createElement("div", null, status.pad_ok ? "Virtual DualShock 4: ready" : `Virtual controller: ${status.pad_message}`)),
             SP_REACT.createElement(DFL.PanelSectionRow, null,
-                SP_REACT.createElement("div", null, status.pc_connected
-                    ? `PC connected: ${status.pc_address} (${status.packets_per_second} packets/s)`
-                    : "Waiting for the PC on Wi-Fi")),
+                SP_REACT.createElement("div", null, linkLine(status))),
             SP_REACT.createElement(DFL.PanelSectionRow, null,
                 SP_REACT.createElement("div", null, `This Deck: ${status.deck_address || "address unknown"}, UDP port ${status.port}`)),
             SP_REACT.createElement(DFL.PanelSectionRow, null,
                 SP_REACT.createElement("div", null, status.message))),
+        SP_REACT.createElement(DFL.PanelSection, { title: "Connection" },
+            SP_REACT.createElement(DFL.PanelSectionRow, null,
+                SP_REACT.createElement(DFL.ButtonItem, { layout: "below", onClick: () => (refused ? connectPc() : disconnectPc()) }, refused ? "Connect to PC" : "Disconnect from PC"))),
+        SP_REACT.createElement(DFL.PanelSection, { title: "Pairing" },
+            SP_REACT.createElement(DFL.PanelSectionRow, null,
+                SP_REACT.createElement("div", null, `Pairing code: ${status.pairing_code || "(none yet)"}`)),
+            SP_REACT.createElement(DFL.PanelSectionRow, null,
+                SP_REACT.createElement(DFL.ButtonItem, { layout: "below", onClick: () => newPairingCode() }, "New pairing code"))),
         SP_REACT.createElement(DFL.PanelSection, { title: "Network" },
             SP_REACT.createElement(DFL.PanelSectionRow, null,
                 SP_REACT.createElement(DFL.ButtonItem, { layout: "below", onClick: () => scanNetwork() }, status.scanning ? "Scanning..." : "Scan network")),

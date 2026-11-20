@@ -1,6 +1,6 @@
 {
   "name": "joycon2studio",
-  "version": "0.2.0",
+  "version": "0.2.8",
   "description": "Joy-Con 2 Studio: shows the PC's controller on the Steam Deck over Wi-Fi (Decky Loader frontend)",
   "type": "module",
   "scripts": {

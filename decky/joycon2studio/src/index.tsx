@@ -7,9 +7,9 @@ type Status = {
   version: string;
   pad_ok: boolean;
   pad_message: string;
-  pc_connected: boolean;
+  link_state: string; // "idle" | "connected" | "refused" | "off"
   pc_address: string;
-  packets_per_second: number;
+  pairing_code: string;
   deck_address: string;
   port: number;
   scanning: boolean;
@@ -19,6 +19,15 @@ type Status = {
 
 const getStatus = callable<[], Status>("status");
 const scanNetwork = callable<[], boolean>("scan");
+const disconnectPc = callable<[], boolean>("disconnect");
+const connectPc = callable<[], boolean>("connect");
+const newPairingCode = callable<[], boolean>("new_pairing_code");
+
+function linkLine(s: Status): string {
+  if (s.link_state === "connected") return `Connected to the PC at ${s.pc_address}`;
+  if (s.link_state === "refused") return "Disconnected by you. Press Connect to accept the PC again.";
+  return "Waiting for the PC. Enter this pairing code on the PC.";
+}
 
 const Content = () => {
   const [status, setStatus] = useState<Status | null>(null);
@@ -55,6 +64,7 @@ const Content = () => {
     );
   }
 
+  const refused = status.link_state === "refused";
   return (
     <>
       <PanelSection title="Status">
@@ -65,17 +75,32 @@ const Content = () => {
           <div>{status.pad_ok ? "Virtual DualShock 4: ready" : `Virtual controller: ${status.pad_message}`}</div>
         </PanelSectionRow>
         <PanelSectionRow>
-          <div>
-            {status.pc_connected
-              ? `PC connected: ${status.pc_address} (${status.packets_per_second} packets/s)`
-              : "Waiting for the PC on Wi-Fi"}
-          </div>
+          <div>{linkLine(status)}</div>
         </PanelSectionRow>
         <PanelSectionRow>
           <div>{`This Deck: ${status.deck_address || "address unknown"}, UDP port ${status.port}`}</div>
         </PanelSectionRow>
         <PanelSectionRow>
           <div>{status.message}</div>
+        </PanelSectionRow>
+      </PanelSection>
+
+      <PanelSection title="Connection">
+        <PanelSectionRow>
+          <ButtonItem layout="below" onClick={() => (refused ? connectPc() : disconnectPc())}>
+            {refused ? "Connect to PC" : "Disconnect from PC"}
+          </ButtonItem>
+        </PanelSectionRow>
+      </PanelSection>
+
+      <PanelSection title="Pairing">
+        <PanelSectionRow>
+          <div>{`Pairing code: ${status.pairing_code || "(none yet)"}`}</div>
+        </PanelSectionRow>
+        <PanelSectionRow>
+          <ButtonItem layout="below" onClick={() => newPairingCode()}>
+            New pairing code
+          </ButtonItem>
         </PanelSectionRow>
       </PanelSection>
 

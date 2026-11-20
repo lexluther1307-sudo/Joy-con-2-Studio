@@ -1,12 +1,11 @@
 """Joy-Con 2 Studio backend for Decky Loader on the Steam Deck (runs as root).
 
-The Windows app reads the Joy-Cons over Bluetooth and sends their state to this Deck over Wi-Fi
-(UDP port 26761). The state is shown to Steam as a virtual DualShock 4, a UHID HID device.
-Steam's rumble is sent back to the PC, which plays it on the Joy-Cons.
+The Windows app reads the Joy-Cons over Bluetooth and sends their state to this Deck over Wi-Fi.
+The link is encrypted with the pairing code shown on this Deck (see joycon2_link.py). The state is shown
+to Steam as a virtual DualShock 4 (a UHID HID device), and Steam's rumble is sent back to the PC.
 """
 
 import asyncio
-import collections
 import os
 import socket
 import struct
@@ -18,21 +17,23 @@ try:
     import decky
 
     log = decky.logger
+    SETTINGS_DIR = getattr(decky, "DECKY_PLUGIN_SETTINGS_DIR", None)
 except Exception:  # outside Decky, for local checks
     import logging
 
     log = logging.getLogger("joycon2studio")
     logging.basicConfig(level=logging.INFO)
+    SETTINGS_DIR = None
 
-VERSION = "0.2.0"
+PLUGIN_DIR = os.environ.get("DECKY_PLUGIN_DIR") or os.path.dirname(os.path.abspath(__file__))
+if PLUGIN_DIR not in sys.path:
+    sys.path.insert(0, PLUGIN_DIR)
+from joycon2_link import NEUTRAL_REPORT, DeckLink, new_pin, normalize_pin  # noqa: E402
 
-# Network bridge: the Windows app sends to this Deck, and rumble goes back to the PC
-BRIDGE_PORT = 26761
-BRIDGE_KEY = b"JC2BRDG1"                # must match the Windows app
-BRIDGE_MAGIC = b"JCB1"
-BRIDGE_HDR = struct.Struct("<4s8sBI")  # magic, key, kind (1 = state from the PC, 2 = rumble to the PC), sequence
-BRIDGE_STALE = 0.5                     # seconds without a state packet before the PC counts as gone
-SCAN_SECONDS = 5.0                     # how long "Scan network" listens
+VERSION = "0.2.8"  # kept in sync by tools/build.py
+
+BRIDGE_PORT = 26761  # the Windows app connects to this UDP port
+SCAN_SECONDS = 5.0  # how long "Scan network" listens
 
 # /dev/uhid (linux/uhid.h)
 UHID_DESTROY = 1
@@ -87,9 +88,6 @@ DS4_REPORT_DESCRIPTOR = bytes([
     0xC0,              # End Collection
 ])
 
-# Sent while the PC is not sending: sticks centred, D-pad released, nothing pressed
-NEUTRAL_REPORT = bytes([0x01, 0x80, 0x80, 0x80, 0x80, 0x08]) + bytes(58)
-
 
 def describe(exc: BaseException) -> str:
     text = str(exc).strip()
@@ -97,7 +95,7 @@ def describe(exc: BaseException) -> str:
 
 
 def own_address() -> str:
-    """This Deck's address on the local network. Connecting a UDP socket sends no packets."""
+    """This Deck's address on the local network. Connecting a UDP socket sends nothing."""
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
             sock.connect(("8.8.8.8", 80))
@@ -204,39 +202,48 @@ class UhidGamepad:
             log.info(f"uhid event {etype}")
 
 
-class BridgeProtocol(asyncio.DatagramProtocol):
-    """Receives controller state from the PC over Wi-Fi (the Windows app's network bridge)."""
+def pairing_file() -> str:
+    base = SETTINGS_DIR or os.path.expanduser("~/homebrew/settings/joycon2studio")
+    return os.path.join(base, "pairing.txt")
 
-    def __init__(self, bridge):
-        self.bridge = bridge
 
-    def datagram_received(self, data, addr):
-        if len(data) != BRIDGE_HDR.size + 64:
-            return
-        magic, key, kind, seq = BRIDGE_HDR.unpack_from(data)
-        if magic != BRIDGE_MAGIC or key != BRIDGE_KEY or kind != 1:
-            return
-        self.bridge.on_bridge_state(data[BRIDGE_HDR.size:], addr, seq)
+def read_code():
+    """The six-digit pairing code shown on the Deck, or None if there is none yet."""
+    try:
+        with open(pairing_file(), encoding="utf-8") as handle:
+            return normalize_pin(handle.read())
+    except (OSError, ValueError):
+        return None
+
+
+def save_code(text: str):
+    path = pairing_file()
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)  # readable by root only
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        handle.write(text + "\n")
+
+
+def load_or_create_code() -> str:
+    pin = read_code()
+    if pin is None:
+        pin = new_pin()
+        save_code(pin)
+    return pin
 
 
 class DeckBridge:
-    """Shows the PC's controller on this Deck as a virtual DualShock 4 and sends rumble back."""
+    """Shows the PC's controller on this Deck as a virtual DualShock 4, over the encrypted link."""
 
     def __init__(self):
         self.loop = None
         self.pad = None
         self.pad_message = "not started"
-        self.transport = None
-        self.pc_addr = None                                   # (ip, port) of the PC's latest state
-        self.pc_report = None                                 # the PC's 64-byte DualShock 4 report
-        self.pc_time = 0.0
-        self.arrivals = collections.deque(maxlen=400)         # arrival times, for packets per second
-        self.senders = {}                                     # PC address -> packets received from it
-        self.rumble = (0, 0)                                  # (small, large) last sent to the PC
+        self.link = None
         self.background = []
+        self.message = "Starting."
         self.scanning = False
         self.scan_result = []
-        self.message = "Starting."
 
     def say(self, text: str):
         self.message = text
@@ -253,76 +260,28 @@ class DeckBridge:
             self.pad = None
             self.pad_message = f"could not create the virtual controller ({describe(exc)}). Needs /dev/uhid and root."
             self.say(self.pad_message)
+        self.link = DeckLink(BRIDGE_PORT, load_or_create_code(), lambda state: None, self.say, on_new_pin=save_code)
         try:
-            self.transport, _ = await self.loop.create_datagram_endpoint(
-                lambda: BridgeProtocol(self), local_addr=("0.0.0.0", BRIDGE_PORT))
-            self.say(f"Listening for the PC on UDP port {BRIDGE_PORT}.")
-        except Exception as exc:
+            self.link.start()
+            self.say(f"Waiting for the PC on UDP port {BRIDGE_PORT}. Enter the pairing code on the PC.")
+        except OSError as exc:
             self.say(f"Network port {BRIDGE_PORT} did not open: {describe(exc)}")
         self.background.append(asyncio.create_task(self._pad_loop()))
 
     async def stop(self):
-        if self.transport is not None:
-            self.transport.close()
-            self.transport = None
         for task in self.background:
             task.cancel()
         self.background = []
+        if self.link is not None:
+            self.link.stop()
         if self.pad is not None:
             self.pad.destroy()
             self.pad = None
 
-    # ---- network ---------------------------------------------------------------
-
-    def on_bridge_state(self, report: bytes, addr, seq: int):
-        now = time.monotonic()
-        if addr[0] not in self.senders:
-            self.say(f"The PC at {addr[0]} is sending its controller.")
-        self.senders[addr[0]] = self.senders.get(addr[0], 0) + 1
-        self.pc_addr = addr
-        self.pc_report = report
-        self.pc_time = now
-        self.arrivals.append(now)
-
-    def pc_active(self) -> bool:
-        return self.pc_report is not None and time.monotonic() - self.pc_time < BRIDGE_STALE
-
-    def packets_per_second(self) -> int:
-        now = time.monotonic()
-        return sum(1 for t in self.arrivals if now - t <= 1.0)
-
-    def _send_rumble_to_pc(self, small: int, large: int):
-        if self.transport is None or self.pc_addr is None:
-            return
-        packet = BRIDGE_HDR.pack(BRIDGE_MAGIC, BRIDGE_KEY, 2, 0) + bytes([small, large])
-        try:
-            self.transport.sendto(packet, self.pc_addr)
-        except OSError:
-            pass
-
-    async def scan_network(self):
-        """Listens for SCAN_SECONDS and reports each address that sent controller data in that time."""
-        self.scanning = True
-        before = dict(self.senders)
-        self.say(f"Scanning the network for {SCAN_SECONDS:.0f} seconds.")
-        await asyncio.sleep(SCAN_SECONDS)
-        found = []
-        for ip, total in self.senders.items():
-            new = total - before.get(ip, 0)
-            if new > 0:
-                found.append(f"PC found at {ip} ({new} packets)")
-        self.scan_result = found or [
-            "No PC found. On the PC, turn on the network bridge and enter this Deck's address."
-        ]
-        self.scanning = False
-        self.say(f"Scan done: {len(found)} PC(s) found.")
-
-    # ---- virtual DualShock 4 ---------------------------------------------------
-
     async def _pad_loop(self):
         while True:
             if self.pad is not None:
-                report = self.pc_report if self.pc_active() else NEUTRAL_REPORT
+                report = self.link.current_report(time.monotonic()) if self.link else NEUTRAL_REPORT
                 try:
                     self.pad.send_input(report)
                 except OSError as exc:
@@ -330,24 +289,53 @@ class DeckBridge:
             await asyncio.sleep(0.01)
 
     def _on_pad_output(self, data: bytes):
-        # Steam's rumble arrives as output report 0x05: small motor in byte 4, large motor in byte 5
-        if len(data) < 6 or data[0] != 0x05:
+        # Steam's rumble: report 0x05, small motor in byte 4, large motor in byte 5
+        if len(data) < 6 or data[0] != 0x05 or self.link is None:
             return
-        small, large = data[4], data[5]
-        if (small, large) != self.rumble:
-            self.rumble = (small, large)
-            if max(small, large) > 0:
-                self.say(f"Steam rumble: large {large}, small {small}")
-        self._send_rumble_to_pc(small, large)
+        self.link.send_rumble(data[4], data[5])
+
+    async def scan_network(self):
+        """Listens for SCAN_SECONDS and reports each PC that sent valid, encrypted packets in that time."""
+        self.scanning = True
+        before = dict(self.link.senders) if self.link else {}
+        self.say(f"Scanning the network for {SCAN_SECONDS:.0f} seconds.")
+        await asyncio.sleep(SCAN_SECONDS)
+        found = []
+        if self.link:
+            for ip, total in self.link.senders.items():
+                new = total - before.get(ip, 0)
+                if new > 0:
+                    found.append(f"PC found at {ip} ({new} packets)")
+        self.scan_result = found or [
+            "No PC found. On the PC, press Connect with this Deck's address and pairing code."
+        ]
+        self.scanning = False
+        self.say(f"Scan done: {len(found)} PC(s) found.")
+
+    def disconnect(self):
+        if self.link is not None:
+            self.link.disconnect()
+
+    def connect(self):
+        if self.link is not None:
+            self.link.connect()
+
+    def new_pairing_code(self):
+        pin = new_pin()
+        save_code(pin)
+        if self.link is not None:
+            self.link.set_pin(pin)
+        self.say("New pairing code made. Enter it on the PC; the old code no longer works.")
 
     def status(self) -> dict:
+        link = self.link
         return {
             "version": VERSION,
             "pad_ok": self.pad is not None,
             "pad_message": self.pad_message,
-            "pc_connected": self.pc_active(),
-            "pc_address": self.pc_addr[0] if self.pc_addr else "",
-            "packets_per_second": self.packets_per_second(),
+            "link_state": link.state if link else "off",
+            "pc_address": link.pc_addr[0] if (link and link.pc_addr) else "",
+            "pairing_code": read_code() or "",
             "deck_address": own_address(),
             "port": BRIDGE_PORT,
             "scanning": self.scanning,
@@ -381,7 +369,7 @@ class Plugin:
         except Exception as exc:
             return {
                 "version": VERSION, "pad_ok": False, "pad_message": f"status error: {exc}",
-                "pc_connected": False, "pc_address": "", "packets_per_second": 0, "deck_address": "",
+                "link_state": "off", "pc_address": "", "pairing_code": "", "deck_address": "",
                 "port": BRIDGE_PORT, "scanning": False, "scan_result": [],
                 "message": traceback.format_exc()[-400:],
             }
@@ -389,4 +377,16 @@ class Plugin:
     async def scan(self):
         if not self.bridge.scanning:
             asyncio.get_running_loop().create_task(self.bridge.scan_network())
+        return True
+
+    async def disconnect(self):
+        self.bridge.disconnect()
+        return True
+
+    async def connect(self):
+        self.bridge.connect()
+        return True
+
+    async def new_pairing_code(self):
+        self.bridge.new_pairing_code()
         return True

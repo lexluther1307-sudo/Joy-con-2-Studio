@@ -3,6 +3,7 @@ import collections
 import ctypes
 import json
 import os
+import queue
 import re
 import shutil
 import socket
@@ -16,7 +17,12 @@ import tkinter as tk
 import urllib.request
 import webbrowser
 from tkinter import colorchooser
+from tkinter import font as tkfont
 from bleak import BleakClient, BleakScanner
+
+# The encrypted Deck link is shared with the Deck plugin (standard library only)
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "decky", "joycon2studio"))
+from joycon2_link import PcLink  # noqa: E402
 
 try:
     import vgamepad as vg
@@ -78,9 +84,6 @@ BATTERY_EVERY_SECONDS = 300.0  # read again every 5 minutes
 # Network bridge: this PC keeps the Joy-Cons and sends the controller state to a Deck over UDP.
 # The Deck presents it to Steam as a DualShock 4 and sends Steam's rumble back here.
 BRIDGE_PORT = 26761
-BRIDGE_KEY = b"JC2BRDG1"                 # must match the Deck plugin
-BRIDGE_MAGIC = b"JCB1"
-BRIDGE_HDR = struct.Struct("<4s8sBI")   # magic, key, kind (1 = state to the Deck, 2 = rumble to the PC), sequence
 DPAD_NIBBLE = {
     (True, False, False, False): 0, (True, False, False, True): 1, (False, False, False, True): 2,
     (False, True, False, True): 3, (False, True, False, False): 4, (False, True, True, False): 5,
@@ -152,6 +155,16 @@ BTN_SR_L = 0x00100000
 BTN_SL_L = 0x00200000
 BTN_L = 0x00400000
 BTN_ZL = 0x00800000
+
+# The buttons that click for the mouse: (left click, right click) for each Joy-Con
+CLICK_BUTTONS = {"R": (BTN_ZR, BTN_R), "L": (BTN_ZL, BTN_L)}
+CLICK_MASK = {"R": BTN_ZR | BTN_R, "L": BTN_ZL | BTN_L}  # both click buttons of each Joy-Con
+# Every button that is a controller press. The click buttons count only while the Joy-Con is a controller.
+CONTROLLER_MASK = (BTN_A | BTN_B | BTN_X | BTN_Y | BTN_UP | BTN_DOWN | BTN_LEFT | BTN_RIGHT |
+                   BTN_PLUS | BTN_MINUS | BTN_HOME | BTN_CAPTURE | BTN_L | BTN_R | BTN_ZL | BTN_ZR |
+                   BTN_L3 | BTN_R3 | BTN_SL_L | BTN_SR_L | BTN_SL_R | BTN_SR_R)
+STICK_PUSHED = 300  # raw distance of a stick from its centre that counts as using the stick
+MOUSE_SLIDE = 3  # sensor counts in one report that count as a Joy-Con sliding across a surface
 
 COLOR_THEMES = [
     ("Switch 2 Default", "#2A2D34", "#181A1F", "#00B8E6", "#FF4E42"),
@@ -240,6 +253,11 @@ def dpad_direction(up, down, left, right):
     return table.get((bool(up), bool(down), bool(left), bool(right)), D.DS4_BUTTON_DPAD_NONE)
 
 
+def _wrap16(d: int) -> int:
+    """A difference of two 16-bit counters, wrapped so a rollover is not read as a jump."""
+    return ((d + 32768) % 65536) - 32768
+
+
 class JoyConState:
     def __init__(self, side: str):
         self.side = side  # "L" or "R"
@@ -267,6 +285,12 @@ class JoyConState:
         self.mouse_acc = [0.0, 0.0]
         self.mouse_left = False
         self.mouse_right = False
+        self.last_active = 0.0  # when this Joy-Con was last used, to decide which one is in use
+        self.mode = "controller"  # "controller" or "mouse": what this Joy-Con is doing (automatic mode)
+        self.controller_at = 0.0  # when its sticks or buttons were last used as a controller
+        self.mouse_at = 0.0  # when it last slid across a surface
+        self.was_pushed = False  # whether its stick was pushed away from the centre in the last report
+        self.stick_prev = (2048, 2048)
 
         # Battery: level in bars (0-9, 9 = full), from byte 46
         self.battery_pct = 0
@@ -326,6 +350,9 @@ class JoyCon2Manager:
         self.gyro_sensitivity = 14.0
         self.mouse_enabled = False
         self.mouse_speed = 0.3
+        self.active_choice = "auto"  # "auto", "L" or "R": which Joy-Con the mouse and sideways mode use
+        self.active_side = None  # the Joy-Con in use right now
+        self.auto_mode = load_settings().get("auto_mode", True)  # switch between mouse and controller by itself
         self.rumble_sample = 1
         self.left.rumble_request = lambda: self.rumble_test(self.left)
         self.right.rumble_request = lambda: self.rumble_test(self.right)
@@ -334,10 +361,7 @@ class JoyCon2Manager:
         self._ds4_failed = False
         self.rumble_large = 0
         self.rumble_small = 0
-        self.bridge_sock = None
-        self.bridge_addr = None
-        self.bridge_seq = 0
-        self.bridge_stop = threading.Event()
+        self.link = PcLink(BRIDGE_PORT, self._bridge_report, self._on_link_state, self._on_link_rumble, self.log)
 
         self.loop = asyncio.new_event_loop()
         self.thread = threading.Thread(target=self._run_loop, daemon=True)
@@ -505,28 +529,41 @@ class JoyCon2Manager:
     def _parse_input_report(self, state: JoyConState, data: bytearray):
         if len(data) < 16:
             return
+        now = time.monotonic()
 
-        # Battery is read from the power channel instead (see _battery_sampler).
-
-        # Bytes 4..8: 32-bit button bitfield
+        # Bytes 4..8: 32-bit button bitfield. Any change means this Joy-Con is being used.
+        previous = state.buttons
         state.buttons = int.from_bytes(data[4:8], byteorder="little")
+        moved = state.buttons != previous
 
         # Bytes 10..15: 12-bit analog sticks
         lx, ly = decode_stick(data[10], data[11], data[12])
         rx, ry = decode_stick(data[13], data[14], data[15])
-
         if state.side == "L" and (lx != 0 or ly != 0):
-            state.stick_x, state.stick_y = lx, ly
+            stick = (lx, ly)
         elif state.side == "R" and (rx != 0 or ry != 0):
-            state.stick_x, state.stick_y = rx, ry
+            stick = (rx, ry)
+        else:
+            stick = None
+        if stick is not None:
+            if abs(stick[0] - state.stick_prev[0]) > 120 or abs(stick[1] - state.stick_prev[1]) > 120:
+                moved = True
+            state.stick_prev = stick
+            state.stick_x, state.stick_y = stick
+        pushed = (abs(state.stick_x - state.center_x) > STICK_PUSHED
+                  or abs(state.stick_y - state.center_y) > STICK_PUSHED)
+        new_push = pushed and not state.was_pushed
+        state.was_pushed = pushed
 
         # Mouse sensor: bytes 16..19, little-endian int16 X and Y (needs feature bit 0x10)
+        sliding = False
         if len(data) >= 20:
-            state.mouse_raw = struct.unpack_from("<hh", data, 16)
-            driver = self.right if self.right.connected else self.left
-            if state is driver:
-                self._move_cursor(state)
-                self._mouse_clicks(state)
+            mx, my = struct.unpack_from("<hh", data, 16)
+            step = abs(_wrap16(mx - state.mouse_raw[0])) + abs(_wrap16(my - state.mouse_raw[1]))
+            if step >= 2:
+                moved = True
+            state.mouse_raw = (mx, my)
+            sliding = step >= MOUSE_SLIDE
 
         # Accel XYZ at bytes 48..53 (+-8 g) and gyro XYZ at bytes 54..59 (+-2000 dps), little-endian int16
         if len(data) >= 60:
@@ -542,18 +579,142 @@ class JoyCon2Manager:
             state.gyro_x = (gx * dps_scale) - state.gyro_bias[0]
             state.gyro_y = (gy * dps_scale) - state.gyro_bias[1]
             state.gyro_z = (gz * dps_scale) - state.gyro_bias[2]
+            turn = max(abs(state.gyro_x), abs(state.gyro_y), abs(state.gyro_z))
+            if turn > 25.0:
+                moved = True
+            if turn > 60.0:
+                sliding = False  # a Joy-Con turned in the hand is aiming, not sliding across a surface
 
+        if moved:
+            state.last_active = now
+        presses = state.buttons & ~previous & CONTROLLER_MASK  # buttons pressed just now
+        if state.mode == "mouse":
+            presses &= ~CLICK_MASK[state.side]  # a click on a mouse is not a new controller press
+        self._update_mode(state, now, pushed, sliding)
+        self._update_active_side(now, control_side=state.side if (presses or new_push) else None)
+        if len(data) >= 20:
+            self._move_cursor(state)
+            self._mouse_clicks(state)
         self._sync_virtual_gamepad()
+
+    ACTIVE_HOLD = 0.6  # seconds: a Joy-Con used this recently keeps control, so two in use do not take turns
+    MODE_HOLD = 0.8  # seconds without controller input before a Joy-Con that is sliding can become a mouse
+
+    def _state_for(self, side):
+        return self.left if side == "L" else self.right
+
+    def _update_active_side(self, now: float, force: bool = False, control_side=None):
+        """Works out which connected Joy-Con is in use. Auto follows whichever was used most recently, and a
+        new press on a Joy-Con takes over at once."""
+        connected = [s for s in (self.right, self.left) if s.connected]
+        if not connected:
+            want = None
+        elif self.active_choice in ("L", "R") and self._state_for(self.active_choice).connected:
+            want = self.active_choice
+        elif len(connected) == 1:
+            want = connected[0].side
+        elif control_side is not None and self._state_for(control_side).connected:
+            want = control_side
+        else:
+            current = self._state_for(self.active_side) if self.active_side else None
+            if current is not None and current.connected and now - current.last_active < self.ACTIVE_HOLD:
+                want = current.side
+            else:
+                want = max(connected, key=lambda s: s.last_active).side
+        if force or want != self.active_side:
+            self._set_active_side(want)
+
+    def set_active_choice(self, choice: str):
+        """From the window: "auto", "L" or "R"."""
+        self.active_choice = choice
+        self._update_active_side(time.monotonic(), force=True)
+
+    def _set_active_side(self, side):
+        old = self.active_side
+        if old is not None and old != side:
+            self._release_mouse_buttons(self._state_for(old))  # no click stays held on the Joy-Con that stopped
+        self.active_side = side
+        if side is not None:
+            self._state_for(side).mouse_acc = [0.0, 0.0]
+            use = self._describe_use()
+            if use and old != side:
+                self.log(f"{'Left' if side == 'L' else 'Right'} Joy-Con is in use for {use}.")
+        self._sync_virtual_gamepad()
+
+    def _describe_use(self) -> str:
+        parts = []
+        if self.mouse_enabled:
+            parts.append("the mouse")
+        if self.sideways_single:
+            parts.append("a sideways controller")
+        return " and ".join(parts)
+
+    def set_auto_mode(self, value: bool):
+        """Turns the automatic switch between mouse and controller on or off."""
+        self.release_mouse()
+        self.auto_mode = bool(value)
+        for state in (self.left, self.right):
+            state.mode = "controller"  # the automatic switch starts again from controller
+        self._sync_virtual_gamepad()
+
+    def _update_mode(self, state: JoyConState, now: float, pushed: bool, sliding: bool):
+        """Automatic mode. A Joy-Con is a controller while its sticks or buttons are used, and a mouse while it
+        slides across a surface with nothing pressed. While it is a mouse, its click buttons are not controller
+        presses, so clicking does not switch it back."""
+        pressed = state.buttons & CONTROLLER_MASK
+        if state.mode == "mouse":
+            pressed &= ~CLICK_MASK[state.side]
+        if pushed or pressed:
+            state.controller_at = now
+        if sliding:
+            state.mouse_at = now
+        if not self.auto_mode:
+            return
+        if now - state.controller_at < self.MODE_HOLD:
+            want = "controller"
+        elif now - state.mouse_at < self.MODE_HOLD:
+            want = "mouse"
+        else:
+            want = state.mode
+        if want != state.mode:
+            state.mode = want
+            if want == "controller":
+                self._release_mouse_buttons(state)  # no click stays held once the Joy-Con is a controller again
+            self.log(f"{'Left' if state.side == 'L' else 'Right'} Joy-Con is now a {want}.")
+
+    def _is_mouse(self, state: JoyConState) -> bool:
+        """True when this Joy-Con is the mouse right now. Never while the Deck has the controller."""
+        if not self.mouse_enabled or self.deck_connected():
+            return False
+        if self.auto_mode:
+            return state.mode == "mouse"
+        return state.side == self.active_side
+
+    def _contributes(self, state: JoyConState) -> bool:
+        """True when this Joy-Con sends its buttons and sticks to the controller, which is when it is not the mouse."""
+        return not self._is_mouse(state)
+
+    def release_mouse(self):
+        """Lets go of any mouse button this app holds, for example when mouse mode is switched off."""
+        for state in (self.left, self.right):
+            self._release_mouse_buttons(state)
+
+    def _release_mouse_buttons(self, state: JoyConState):
+        if state.mouse_left:
+            ctypes.windll.user32.mouse_event(0x0004, 0, 0, 0, 0)  # MOUSEEVENTF_LEFTUP
+            state.mouse_left = False
+        if state.mouse_right:
+            ctypes.windll.user32.mouse_event(0x0010, 0, 0, 0, 0)  # MOUSEEVENTF_RIGHTUP
+            state.mouse_right = False
 
     def _move_cursor(self, state: JoyConState):
         mx, my = state.mouse_raw
         prev = state.mouse_prev
-        state.mouse_prev = (mx, my)
-        if prev is None or not self.mouse_enabled:
+        state.mouse_prev = (mx, my)  # kept current for both Joy-Cons, so switching never makes the cursor jump
+        if prev is None or state.side != self.active_side or not self._is_mouse(state):
             return
-        # Wrap-around int16 difference, so a counter rollover does not jump the cursor
-        dx = ((mx - prev[0] + 32768) % 65536) - 32768
-        dy = ((my - prev[1] + 32768) % 65536) - 32768
+        dx = _wrap16(mx - prev[0])  # a counter rollover is not a jump
+        dy = _wrap16(my - prev[1])
         state.mouse_acc[0] += dx * self.mouse_speed
         state.mouse_acc[1] += dy * self.mouse_speed
         ix, iy = int(state.mouse_acc[0]), int(state.mouse_acc[1])
@@ -563,10 +724,11 @@ class JoyCon2Manager:
             ctypes.windll.user32.mouse_event(0x0001, ix, iy, 0, 0)  # MOUSEEVENTF_MOVE
 
     def _mouse_clicks(self, state: JoyConState):
-        if not self.mouse_enabled:
+        if state.side != self.active_side or not self._is_mouse(state):
             return
-        left = bool(state.buttons & BTN_ZR)
-        right = bool(state.buttons & BTN_R)
+        left_mask, right_mask = CLICK_BUTTONS[state.side]
+        left = bool(state.buttons & left_mask)
+        right = bool(state.buttons & right_mask)
         if left != state.mouse_left:
             ctypes.windll.user32.mouse_event(0x0002 if left else 0x0004, 0, 0, 0, 0)
             state.mouse_left = left
@@ -653,7 +815,7 @@ class JoyCon2Manager:
         self.output = mode
         if mode == "x360":
             self.ds4 = None  # releasing the DualShock 4 object unplugs it
-            if HAS_VGAMEPAD and self.gamepad is None:
+            if HAS_VGAMEPAD and self.gamepad is None and not self.deck_connected():
                 try:
                     self.gamepad = vg.VX360Gamepad()
                 except Exception as e:
@@ -711,51 +873,35 @@ class JoyCon2Manager:
 
     # ---- network bridge to a Deck -------------------------------------------
 
-    def start_bridge(self, ip: str):
-        self.stop_bridge()
-        if not ip:
-            return
-        self.bridge_addr = (ip, BRIDGE_PORT)
-        self.bridge_stop.clear()
-        self.bridge_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self.bridge_sock.bind(("", 0))
-        sock = self.bridge_sock
-        threading.Thread(target=self._bridge_send_loop, args=(sock,), daemon=True).start()
-        threading.Thread(target=self._bridge_recv_loop, args=(sock,), daemon=True).start()
-        self.log(f"Sending the controller to the Deck at {ip}.")
+    def start_bridge(self, ip: str, code: str) -> str:
+        """Starts the link. Returns "" when it started, or the reason it did not."""
+        if self.link.state != "off":
+            self.link.disconnect()
+        try:
+            self.link.configure(ip, code)
+            self.link.start()
+        except ValueError as exc:
+            self.log(str(exc))
+            return str(exc)
+        return ""
 
     def stop_bridge(self):
-        self.bridge_stop.set()
-        sock, self.bridge_sock = self.bridge_sock, None
-        if sock is not None:
-            try:
-                sock.close()
-            except OSError:
-                pass
+        self.link.disconnect()
 
-    def _bridge_send_loop(self, sock):
-        while not self.bridge_stop.is_set():
-            try:
-                self.bridge_seq = (self.bridge_seq + 1) & 0xFFFFFFFF
-                packet = BRIDGE_HDR.pack(BRIDGE_MAGIC, BRIDGE_KEY, 1, self.bridge_seq) + self._bridge_report()
-                sock.sendto(packet, self.bridge_addr)
-            except OSError:
-                pass
-            time.sleep(0.01)
+    def deck_connected(self) -> bool:
+        return self.link.state == "connected"
 
-    def _bridge_recv_loop(self, sock):
-        while not self.bridge_stop.is_set():
-            try:
-                data, _ = sock.recvfrom(256)
-            except OSError:
-                break
-            if len(data) < BRIDGE_HDR.size + 2:
-                continue
-            magic, key, kind, _seq = BRIDGE_HDR.unpack_from(data)
-            if magic != BRIDGE_MAGIC or key != BRIDGE_KEY or kind != 2:
-                continue
-            self.rumble_small = data[BRIDGE_HDR.size]
-            self.rumble_large = data[BRIDGE_HDR.size + 1]
+    def _on_link_state(self, state: str):
+        # Runs on the link's thread. Connected: the Deck has the controller, so this PC lets go of it.
+        if state == "connected":
+            self._sync_virtual_gamepad()
+        else:
+            self.rumble_large = self.rumble_small = 0  # no rumble left over from the Deck
+            self._restore_virtual_gamepad()  # this PC uses the Joy-Cons again
+
+    def _on_link_rumble(self, small: int, large: int):
+        self.rumble_small = small
+        self.rumble_large = large
 
     def _bridge_report(self) -> bytes:
         """The 64-byte DualShock 4 input report for the current Joy-Con state (the Deck passes it to Steam)."""
@@ -795,19 +941,63 @@ class JoyCon2Manager:
         rep[30] = 0x1B
         return bytes(rep)
 
+    def _sideways_joycon(self):
+        """The one Joy-Con that works alone, held sideways: the one in use, while it is a controller."""
+        if not self.sideways_single or self.active_side is None:
+            return None
+        jc = self._state_for(self.active_side)
+        return jc if (jc.connected and self._contributes(jc)) else None
+
+    def _sideways_pad(self, jc: JoyConState):
+        """One Joy-Con held sideways as an Xbox-style pad: (stick x, stick y, set of pressed button names)."""
+        b = jc.buttons
+        sx = self._norm_axis(jc.stick_x, jc.center_x)
+        sy = self._norm_axis(jc.stick_y, jc.center_y)
+        if jc.side == "L":
+            stick = (-sy, sx)
+            pressed = (
+                ("A", b & BTN_DOWN), ("B", b & BTN_RIGHT), ("X", b & BTN_LEFT), ("Y", b & BTN_UP),
+                ("LB", b & BTN_SL_L), ("RB", b & BTN_SR_L), ("START", b & BTN_MINUS), ("LS", b & BTN_L3),
+            )
+        else:
+            stick = (sy, -sx)
+            pressed = (
+                ("A", b & BTN_X), ("B", b & BTN_A), ("X", b & BTN_Y), ("Y", b & BTN_B),
+                ("LB", b & BTN_SL_R), ("RB", b & BTN_SR_R), ("START", b & BTN_PLUS), ("LS", b & BTN_R3),
+            )
+        return stick[0], stick[1], {name for name, on in pressed if on}
+
     def _sync_ds4(self):
         ds4 = self._ensure_ds4()
         if ds4 is None:
             return
         D = vg.DS4_BUTTONS
         ds4.reset()
-        b = (self.left.buttons if self.left.connected else 0) | (
-            self.right.buttons if self.right.connected else 0
-        )
-        lx = self._norm_axis(self.left.stick_x, self.left.center_x) if self.left.connected else 0
-        ly = self._norm_axis(self.left.stick_y, self.left.center_y) if self.left.connected else 0
-        rx = self._norm_axis(self.right.stick_x, self.right.center_x) if self.right.connected else 0
-        ry = self._norm_axis(self.right.stick_y, self.right.center_y) if self.right.connected else 0
+        if self.sideways_single:
+            jc = self._sideways_joycon()
+            if jc is not None:
+                # Sideways: the Joy-Con in use is the whole controller, laid out like a pad
+                sx, sy, pressed = self._sideways_pad(jc)
+                ds4.left_joystick_float(sx / 32767.0, -sy / 32767.0)
+                buttons = {
+                    "A": D.DS4_BUTTON_CROSS, "B": D.DS4_BUTTON_CIRCLE,
+                    "X": D.DS4_BUTTON_SQUARE, "Y": D.DS4_BUTTON_TRIANGLE,
+                    "LB": D.DS4_BUTTON_SHOULDER_LEFT, "RB": D.DS4_BUTTON_SHOULDER_RIGHT,
+                    "START": D.DS4_BUTTON_OPTIONS, "LS": D.DS4_BUTTON_THUMB_LEFT,
+                }
+                for name in pressed:
+                    ds4.press_button(buttons[name])
+                ds4.gyroscope(*(clamp16(int(v * 16)) for v in (jc.gyro_x, jc.gyro_y, jc.gyro_z)))
+                ds4.accelerometer(*(clamp16(int(v * 8192)) for v in (jc.accel_x, jc.accel_y, jc.accel_z)))
+            ds4.update()  # neutral while the Joy-Con in use is the mouse
+            return
+        left_on = self.left.connected and self._contributes(self.left)
+        right_on = self.right.connected and self._contributes(self.right)
+        b = (self.left.buttons if left_on else 0) | (self.right.buttons if right_on else 0)
+        lx = self._norm_axis(self.left.stick_x, self.left.center_x) if left_on else 0
+        ly = self._norm_axis(self.left.stick_y, self.left.center_y) if left_on else 0
+        rx = self._norm_axis(self.right.stick_x, self.right.center_x) if right_on else 0
+        ry = self._norm_axis(self.right.stick_y, self.right.center_y) if right_on else 0
         # DualShock 4 sticks are 8-bit with 128 as center, and Y is inverted (0 = up)
         ds4.left_joystick_float(lx / 32767.0, -ly / 32767.0)
         ds4.right_joystick_float(rx / 32767.0, -ry / 32767.0)
@@ -836,7 +1026,7 @@ class JoyCon2Manager:
         if b & BTN_CAPTURE:
             ds4.press_special_button(vg.DS4_SPECIAL_BUTTONS.DS4_SPECIAL_BUTTON_TOUCHPAD)
         ds4.directional_pad(dpad_direction(b & BTN_UP, b & BTN_DOWN, b & BTN_LEFT, b & BTN_RIGHT))
-        driver = self.right if self.right.connected else (self.left if self.left.connected else None)
+        driver = self.right if right_on else (self.left if left_on else None)
         if driver is not None:
             # DualShock 4 units: 16 LSB per deg/s and 8192 LSB per g
             ds4.gyroscope(*(clamp16(int(v * 16)) for v in (driver.gyro_x, driver.gyro_y, driver.gyro_z)))
@@ -858,7 +1048,32 @@ class JoyCon2Manager:
             self.ds4.reset()
             self.ds4.update()
 
+    def _release_virtual_gamepads(self):
+        """Unplugs this PC's virtual controller, so Windows and its games do not see the Joy-Cons."""
+        if self.gamepad is not None:
+            self.gamepad.reset()
+            self.gamepad.update()
+            self.gamepad = None  # releasing the Xbox 360 object unplugs it
+        if self.ds4 is not None:
+            self.ds4.reset()
+            self.ds4.update()
+            self.ds4 = None  # releasing the DualShock 4 object unplugs it
+
+    def _restore_virtual_gamepad(self):
+        """Plugs this PC's virtual controller back in when the Deck bridge stops."""
+        self._ds4_failed = False
+        if self.output == "x360" and HAS_VGAMEPAD and self.gamepad is None:
+            try:
+                self.gamepad = vg.VX360Gamepad()
+            except Exception as e:
+                self.log(f"ViGEmBus driver warning: {e}")
+        self._sync_virtual_gamepad()
+
     def _sync_virtual_gamepad(self):
+        if self.deck_connected():
+            # The Deck has the controller while it is connected, so this PC's virtual controller stays unplugged
+            self._release_virtual_gamepads()
+            return
         if self.output == "ds4":
             self._sync_ds4()
             return
@@ -866,59 +1081,28 @@ class JoyCon2Manager:
             return
 
         self.gamepad.reset()
-        only_one = self.left.connected ^ self.right.connected
-
-        # Single Joy-Con Sideways Mode (horizontal standalone controller)
-        if only_one and self.sideways_single:
-            jc = self.left if self.left.connected else self.right
-            b = jc.buttons
-            sx = self._norm_axis(jc.stick_x, jc.center_x)
-            sy = self._norm_axis(jc.stick_y, jc.center_y)
-
-            if jc.side == "L":
-                self.gamepad.left_joystick(x_value=-sy, y_value=sx)
-                if b & BTN_DOWN:
-                    self.gamepad.press_button(vg.XUSB_BUTTON.XUSB_GAMEPAD_A)
-                if b & BTN_RIGHT:
-                    self.gamepad.press_button(vg.XUSB_BUTTON.XUSB_GAMEPAD_B)
-                if b & BTN_LEFT:
-                    self.gamepad.press_button(vg.XUSB_BUTTON.XUSB_GAMEPAD_X)
-                if b & BTN_UP:
-                    self.gamepad.press_button(vg.XUSB_BUTTON.XUSB_GAMEPAD_Y)
-                if b & BTN_SL_L:
-                    self.gamepad.press_button(vg.XUSB_BUTTON.XUSB_GAMEPAD_LEFT_SHOULDER)
-                if b & BTN_SR_L:
-                    self.gamepad.press_button(vg.XUSB_BUTTON.XUSB_GAMEPAD_RIGHT_SHOULDER)
-                if b & BTN_MINUS:
-                    self.gamepad.press_button(vg.XUSB_BUTTON.XUSB_GAMEPAD_START)
-                if b & BTN_L3:
-                    self.gamepad.press_button(vg.XUSB_BUTTON.XUSB_GAMEPAD_LEFT_THUMB)
-            else:
-                self.gamepad.left_joystick(x_value=sy, y_value=-sx)
-                if b & BTN_X:
-                    self.gamepad.press_button(vg.XUSB_BUTTON.XUSB_GAMEPAD_A)
-                if b & BTN_A:
-                    self.gamepad.press_button(vg.XUSB_BUTTON.XUSB_GAMEPAD_B)
-                if b & BTN_Y:
-                    self.gamepad.press_button(vg.XUSB_BUTTON.XUSB_GAMEPAD_X)
-                if b & BTN_B:
-                    self.gamepad.press_button(vg.XUSB_BUTTON.XUSB_GAMEPAD_Y)
-                if b & BTN_SL_R:
-                    self.gamepad.press_button(vg.XUSB_BUTTON.XUSB_GAMEPAD_LEFT_SHOULDER)
-                if b & BTN_SR_R:
-                    self.gamepad.press_button(vg.XUSB_BUTTON.XUSB_GAMEPAD_RIGHT_SHOULDER)
-                if b & BTN_PLUS:
-                    self.gamepad.press_button(vg.XUSB_BUTTON.XUSB_GAMEPAD_START)
-                if b & BTN_R3:
-                    self.gamepad.press_button(vg.XUSB_BUTTON.XUSB_GAMEPAD_LEFT_THUMB)
-
-            self.gamepad.update()
+        if self.sideways_single:
+            jc = self._sideways_joycon()
+            if jc is not None:
+                # Sideways: the Joy-Con in use is the whole controller, laid out like a pad
+                xb = vg.XUSB_BUTTON
+                names = {
+                    "A": xb.XUSB_GAMEPAD_A, "B": xb.XUSB_GAMEPAD_B,
+                    "X": xb.XUSB_GAMEPAD_X, "Y": xb.XUSB_GAMEPAD_Y,
+                    "LB": xb.XUSB_GAMEPAD_LEFT_SHOULDER, "RB": xb.XUSB_GAMEPAD_RIGHT_SHOULDER,
+                    "START": xb.XUSB_GAMEPAD_START, "LS": xb.XUSB_GAMEPAD_LEFT_THUMB,
+                }
+                sx, sy, pressed = self._sideways_pad(jc)
+                self.gamepad.left_joystick(x_value=sx, y_value=sy)
+                for name in pressed:
+                    self.gamepad.press_button(names[name])
+            self.gamepad.update()  # neutral while the Joy-Con in use is the mouse
             return
 
         # Standard Unified Mode (works with Left only, Right only, or Both merged)
-        b = (self.left.buttons if self.left.connected else 0) | (
-            self.right.buttons if self.right.connected else 0
-        )
+        left_on = self.left.connected and self._contributes(self.left)
+        right_on = self.right.connected and self._contributes(self.right)
+        b = (self.left.buttons if left_on else 0) | (self.right.buttons if right_on else 0)
 
         btn_pairs = [
             (BTN_A, vg.XUSB_BUTTON.XUSB_GAMEPAD_A),
@@ -944,15 +1128,13 @@ class JoyCon2Manager:
         self.gamepad.left_trigger(255 if (b & BTN_ZL) else 0)
         self.gamepad.right_trigger(255 if (b & BTN_ZR) else 0)
 
-        lx = self._norm_axis(self.left.stick_x, self.left.center_x) if self.left.connected else 0
-        ly = self._norm_axis(self.left.stick_y, self.left.center_y) if self.left.connected else 0
-        rx = self._norm_axis(self.right.stick_x, self.right.center_x) if self.right.connected else 0
-        ry = self._norm_axis(self.right.stick_y, self.right.center_y) if self.right.connected else 0
+        lx = self._norm_axis(self.left.stick_x, self.left.center_x) if left_on else 0
+        ly = self._norm_axis(self.left.stick_y, self.left.center_y) if left_on else 0
+        rx = self._norm_axis(self.right.stick_x, self.right.center_x) if right_on else 0
+        ry = self._norm_axis(self.right.stick_y, self.right.center_y) if right_on else 0
 
         if self.gyro_aim_enabled:
-            active_imu = (
-                self.right if self.right.connected else (self.left if self.left.connected else None)
-            )
+            active_imu = self.right if right_on else (self.left if left_on else None)
             if active_imu:
                 gx_add = int(
                     max(-1.0, min(1.0, -active_imu.gyro_z * self.gyro_sensitivity / 360.0)) * 32767
@@ -969,52 +1151,49 @@ class JoyCon2Manager:
 
 
 # ---- Look and feel ----------------------------------------------------------
-BG = "#0E1116"
-SURFACE = "#161B22"
-SURFACE_2 = "#1C232D"
-BORDER = "#2A3240"
-TEXT = "#E6EDF3"
-MUTED = "#8B95A5"
-ACCENT = "#3B82F6"
-ACCENT_HOVER = "#2563EB"
-GOOD = "#22C55E"
-GOOD_BG = "#14321F"
-WARN = "#F59E0B"
-BAD = "#EF4444"
-ACTIVE_L = "#38BDF8"
+# --- Material 3 colour roles (dark scheme). The names follow the M3 roles, so the palette can be swapped. ---
+BG = "#141218"               # background
+SURFACE = "#211F26"          # surface container: cards
+SURFACE_2 = "#2B2930"        # surface container high: panels inside cards
+SURFACE_3 = "#36343B"        # surface container highest: fields and bars
+BORDER = "#49454F"           # outline variant
+OUTLINE = "#938F99"          # outline
+TEXT = "#E6E0E9"             # on surface
+MUTED = "#CAC4D0"            # on surface variant
+PRIMARY = "#D0BCFF"
+ON_PRIMARY = "#381E72"
+PRIMARY_CONTAINER = "#4F378B"
+ON_PRIMARY_CONTAINER = "#EADDFF"
+SECONDARY_CONTAINER = "#4A4458"
+ON_SECONDARY_CONTAINER = "#E8DEF8"
+ERROR = "#F2B8B5"
+ERROR_CONTAINER = "#8C1D18"
+ON_ERROR_CONTAINER = "#F9DEDC"
+GOOD = "#A8DAB5"
+GOOD_CONTAINER = "#1F4D2E"
+ON_GOOD_CONTAINER = "#C4F0D0"
+WARN = "#F5C98C"
+WARN_CONTAINER = "#4F3A14"
+ON_WARN_CONTAINER = "#FFDDB0"
+INVERSE_SURFACE = "#E6E0E9"  # the snackbar
+INVERSE_TEXT = "#322F35"
+BAD = ERROR                  # low battery
+ACCENT = PRIMARY             # bars
+ACTIVE_L = "#38BDF8"         # buttons pressed on the Joy-Con preview
 ACTIVE_R = "#F87171"
 FONT = "Segoe UI"
 MONO = "Consolas"
 
 
-def make_button(parent, text, command, style="secondary", size=9, padx=12, pady=5):
-    bg, hover, fg = {
-        "primary": (ACCENT, ACCENT_HOVER, "#FFFFFF"),
-        "secondary": (SURFACE_2, "#263040", TEXT),
-        "danger": ("#3A1D24", "#4B2630", "#FCA5A5"),
-    }[style]
-    btn = tk.Button(
-        parent,
-        text=text,
-        command=command,
-        font=(FONT, size, "bold" if style == "primary" else "normal"),
-        bg=bg,
-        fg=fg,
-        activebackground=hover,
-        activeforeground=fg,
-        relief="flat",
-        bd=0,
-        padx=padx,
-        pady=pady,
-        cursor="hand2",
+def _mix(a: str, b: str, t: float) -> str:
+    """Blends colour a towards colour b by t, from 0 to 1."""
+    ra, ga, ba = int(a[1:3], 16), int(a[3:5], 16), int(a[5:7], 16)
+    rb, gb, bb = int(b[1:3], 16), int(b[3:5], 16), int(b[5:7], 16)
+    return "#%02X%02X%02X" % (
+        round(ra + (rb - ra) * t),
+        round(ga + (gb - ga) * t),
+        round(ba + (bb - ba) * t),
     )
-    btn.bind("<Enter>", lambda _e: btn.config(bg=hover))
-    btn.bind("<Leave>", lambda _e: btn.config(bg=bg))
-    return btn
-
-
-def make_pill(parent, text, fg, bg):
-    return tk.Label(parent, text=text, font=(FONT, 8, "bold"), fg=fg, bg=bg, padx=10, pady=3)
 
 
 def rounded_rect(canvas, x1, y1, x2, y2, r, **kw):
@@ -1026,141 +1205,602 @@ def rounded_rect(canvas, x1, y1, x2, y2, r, **kw):
     return canvas.create_polygon(pts, smooth=True, **kw)
 
 
-def draw_shell(canvas, s: JoyConState):
+def make_chip(parent, text, bg, fg):
+    """A small tonal label: the Material 3 chip used for status."""
+    return tk.Label(parent, text=text, font=(FONT, 9, "bold"), fg=fg, bg=bg, padx=12, pady=5)
+
+
+class Card(tk.Canvas):
+    """A rounded surface. Put the content in .body; the card grows to fit it."""
+
+    def __init__(self, parent, bg=BG, fill=SURFACE, pad=18, radius=22):
+        super().__init__(parent, bg=bg, highlightthickness=0, bd=0, height=1)
+        self.fill = fill
+        self.pad = pad
+        self.radius = radius
+        self.body = tk.Frame(self, bg=fill)
+        self._win = self.create_window(pad, pad, anchor="nw", window=self.body)
+        self.bind("<Configure>", self._fit)
+        self.body.bind("<Configure>", self._fit)
+
+    def _fit(self, _event=None):
+        w = self.winfo_width()
+        if w < 2 * self.pad + 4:
+            return
+        h = self.body.winfo_reqheight() + 2 * self.pad
+        self.itemconfigure(self._win, width=w - 2 * self.pad)
+        if int(self.cget("height")) != h:
+            self.configure(height=h)
+        self.delete("bg")
+        rounded_rect(self, 0, 0, w, h, self.radius, fill=self.fill, outline="", tags="bg")
+        self.tag_lower("bg")
+
+
+class M3Button(tk.Canvas):
+    """A Material 3 button: filled, tonal, outlined, text or danger. Drawn on a canvas so the corners are round."""
+
+    LOOK = {
+        # style: (fill, text colour, outline)
+        "filled": (PRIMARY, ON_PRIMARY, None),
+        "tonal": (SECONDARY_CONTAINER, ON_SECONDARY_CONTAINER, None),
+        "outlined": (None, PRIMARY, OUTLINE),
+        "text": (None, PRIMARY, None),
+        "danger": (ERROR_CONTAINER, ON_ERROR_CONTAINER, None),
+    }
+
+    def __init__(self, parent, text, command=None, style="tonal", bg=BG, compact=False):
+        self._font = tkfont.Font(family=FONT, size=9 if compact else 10, weight="bold")
+        self._pad = 14 if compact else 22
+        self._h = 32 if compact else 40
+        self._text = text
+        self._command = command
+        self._style = style
+        self._bg = bg
+        self._enabled = True
+        self._hover = False
+        self._down = False
+        super().__init__(parent, width=self._text_width(), height=self._h, bg=bg,
+                         highlightthickness=0, bd=0, cursor="hand2")
+        self.bind("<Enter>", lambda _e: self._flag(hover=True))
+        self.bind("<Leave>", lambda _e: self._flag(hover=False, down=False))
+        self.bind("<ButtonPress-1>", lambda _e: self._flag(down=True))
+        self.bind("<ButtonRelease-1>", self._release)
+        self.bind("<Configure>", lambda _e: self._draw())
+        self._draw()
+
+    def _text_width(self):
+        return self._font.measure(self._text) + 2 * self._pad
+
+    def _flag(self, **flags):
+        self._hover = flags.get("hover", self._hover)
+        self._down = flags.get("down", self._down)
+        self._draw()
+
+    def _release(self, event):
+        inside = 0 <= event.x < self.winfo_width() and 0 <= event.y < self.winfo_height()
+        fire = self._down and inside and self._enabled
+        self._down = False
+        self._draw()
+        if fire and self._command:
+            self._command()
+
+    def configure(self, **kw):
+        if "text" in kw:
+            self._text = kw.pop("text")
+            kw["width"] = self._text_width()
+        if "command" in kw:
+            self._command = kw.pop("command")
+        if "state" in kw:
+            self._enabled = kw.pop("state") != "disabled"
+            kw["cursor"] = "hand2" if self._enabled else "arrow"
+        super().configure(**kw)
+        self._draw()
+
+    config = configure
+
+    def _draw(self):
+        self.delete("all")
+        w, h = self.winfo_width(), self.winfo_height()
+        if w < 4:
+            return
+        fill, fg, outline = self.LOOK[self._style]
+        if not self._enabled:
+            fg = _mix(fg, self._bg, 0.6)
+            fill = _mix(fill, self._bg, 0.88) if fill else None
+            outline = _mix(outline, self._bg, 0.6) if outline else None
+        layer = 0.0
+        if self._enabled:
+            layer = 0.12 if self._down else (0.08 if self._hover else 0.0)
+        if layer:
+            fill = _mix(fill or self._bg, fg, layer)  # the hover and press tint
+        if fill or outline:
+            rounded_rect(self, 1, 1, w - 1, h - 1, (h - 2) // 2,
+                         fill=fill or self._bg, outline=outline or "", width=1)
+        self.create_text(w // 2, h // 2, text=self._text, fill=fg, font=self._font)
+
+
+class M3Switch(tk.Canvas):
+    """A Material 3 switch, bound to a BooleanVar."""
+
+    def __init__(self, parent, variable, command=None, bg=BG):
+        super().__init__(parent, width=52, height=32, bg=bg, highlightthickness=0, bd=0, cursor="hand2")
+        self.var = variable
+        self.command = command
+        self.bind("<Button-1>", self._click)
+        variable.trace_add("write", lambda *_: self._draw())
+        self._draw()
+
+    def _click(self, _event):
+        self.var.set(not self.var.get())
+        if self.command:
+            self.command()
+
+    def _draw(self):
+        self.delete("all")
+        on = bool(self.var.get())
+        rounded_rect(self, 2, 2, 50, 30, 14, fill=PRIMARY if on else SURFACE_3,
+                     outline=PRIMARY if on else OUTLINE, width=2)
+        cx, r = (38, 10) if on else (16, 7)
+        self.create_oval(cx - r, 16 - r, cx + r, 16 + r, fill=ON_PRIMARY if on else OUTLINE, outline="")
+
+
+class M3Segmented(tk.Canvas):
+    """Choices in one rounded strip, like a Material 3 segmented button. Bound to a StringVar."""
+
+    def __init__(self, parent, choices, variable, command=None, width=320, bg=BG):
+        super().__init__(parent, width=width, height=40, bg=bg, highlightthickness=0, bd=0, cursor="hand2")
+        self.choices = list(choices)
+        self.var = variable
+        self.command = command
+        self._bg = bg
+        self._font = tkfont.Font(family=FONT, size=9, weight="bold")
+        self.bind("<Button-1>", self._click)
+        self.bind("<Configure>", lambda _e: self._draw())
+        variable.trace_add("write", lambda *_: self._draw())
+        self._draw()
+
+    def _draw(self):
+        self.delete("all")
+        w, h = self.winfo_width(), self.winfo_height()
+        if w < 4:
+            return
+        seg = w / len(self.choices)
+        chosen = self.var.get()
+        rounded_rect(self, 1, 1, w - 1, h - 1, (h - 2) // 2, fill=self._bg, outline=OUTLINE, width=1)
+        for i, choice in enumerate(self.choices):
+            x0, x1 = i * seg, (i + 1) * seg
+            on = choice == chosen
+            if on:
+                rounded_rect(self, x0 + 4, 4, x1 - 4, h - 4, (h - 8) // 2, fill=SECONDARY_CONTAINER, outline="")
+            elif i > 0 and self.choices[i - 1] != chosen:
+                self.create_line(x0, 10, x0, h - 10, fill=OUTLINE)
+            self.create_text((x0 + x1) / 2, h / 2, text=choice,
+                             fill=ON_SECONDARY_CONTAINER if on else MUTED, font=self._font)
+
+    def _click(self, event):
+        w = max(1, self.winfo_width())
+        index = min(len(self.choices) - 1, int(event.x * len(self.choices) / w))
+        choice = self.choices[index]
+        self.var.set(choice)
+        if self.command:
+            self.command(choice)
+
+
+class M3Slider(tk.Canvas):
+    """A Material 3 slider: a value from lo to hi, moved with the mouse, in steps."""
+
+    PAD = 12
+
+    def __init__(self, parent, lo, hi, value, command=None, step=0.05, width=200, bg=BG):
+        super().__init__(parent, width=width, height=28, bg=bg, highlightthickness=0, bd=0, cursor="hand2")
+        self._lo, self._hi, self._step = lo, hi, step
+        self._value = self._snap(value)
+        self.command = command
+        self.bind("<Configure>", lambda _e: self._draw())
+        self.bind("<Button-1>", self._drag)
+        self.bind("<B1-Motion>", self._drag)
+        self._draw()
+
+    def _snap(self, value):
+        value = max(self._lo, min(self._hi, float(value)))
+        return round(round((value - self._lo) / self._step) * self._step + self._lo, 2)
+
+    def get(self):
+        return self._value
+
+    def set(self, value):
+        self._value = self._snap(value)
+        self._draw()
+
+    def _drag(self, event):
+        w = max(1, self.winfo_width() - 2 * self.PAD)
+        frac = max(0.0, min(1.0, (event.x - self.PAD) / w))
+        self._value = self._snap(self._lo + frac * (self._hi - self._lo))
+        self._draw()
+        if self.command:
+            self.command(self._value)
+
+    def _draw(self):
+        self.delete("all")
+        w = self.winfo_width()
+        if w < 4:
+            return
+        frac = (self._value - self._lo) / (self._hi - self._lo)
+        x = self.PAD + frac * (w - 2 * self.PAD)
+        self.create_line(self.PAD, 14, w - self.PAD, 14, fill=SURFACE_3, width=4, capstyle="round")
+        self.create_line(self.PAD, 14, x, 14, fill=PRIMARY, width=4, capstyle="round")
+        self.create_oval(x - 9, 5, x + 9, 23, fill=PRIMARY, outline="")
+
+
+class M3Field(tk.Frame):
+    """A labelled text field drawn as a rounded outline, with a short helper line under it."""
+
+    def __init__(self, parent, label, variable, helper="", width=240, bg=BG):
+        super().__init__(parent, bg=bg)
+        self._fw = width
+        self._focused = False
+        tk.Label(self, text=label, font=(FONT, 9), fg=MUTED, bg=bg).pack(anchor="w")
+        self._box = tk.Canvas(self, width=width, height=44, bg=bg, highlightthickness=0, bd=0)
+        self._box.pack(anchor="w", pady=(4, 0))
+        self.entry = tk.Entry(self._box, textvariable=variable, font=(FONT, 10), bg=SURFACE_3, fg=TEXT,
+                              insertbackground=TEXT, relief="flat", bd=0, highlightthickness=0)
+        self._box.create_window(14, 22, anchor="w", window=self.entry, width=width - 28)
+        self.entry.bind("<FocusIn>", lambda _e: self._set_focus(True))
+        self.entry.bind("<FocusOut>", lambda _e: self._set_focus(False))
+        self._draw()
+        if helper:
+            tk.Label(self, text=helper, font=(FONT, 8), fg=MUTED, bg=bg, justify="left",
+                     wraplength=width).pack(anchor="w", pady=(4, 0))
+
+    def _set_focus(self, on):
+        self._focused = on
+        self._draw()
+
+    def _draw(self):
+        self._box.delete("outline")
+        w = self._fw
+        if self._focused:
+            rounded_rect(self._box, 1, 1, w - 1, 43, 12, fill=SURFACE_3, outline=PRIMARY, width=2, tags="outline")
+        else:
+            rounded_rect(self._box, 1, 1, w - 1, 43, 12, fill=SURFACE_3, outline=OUTLINE, width=1, tags="outline")
+        self._box.tag_lower("outline")
+
+
+class M3Menu(tk.Canvas):
+    """A Material 3 exposed dropdown: shows the chosen value, and a click opens the list."""
+
+    def __init__(self, parent, choices, variable, command=None, width=320, bg=BG):
+        super().__init__(parent, width=width, height=44, bg=bg, highlightthickness=0, bd=0, cursor="hand2")
+        self.var = variable
+        self.command = command
+        self._font = tkfont.Font(family=FONT, size=10)
+        self._menu = tk.Menu(self, tearoff=0, bg=SURFACE_2, fg=TEXT, activebackground=PRIMARY_CONTAINER,
+                             activeforeground=ON_PRIMARY_CONTAINER, font=(FONT, 10), bd=0, relief="flat")
+        for choice in choices:
+            self._menu.add_command(label=choice, command=lambda c=choice: self._pick(c))
+        self.bind("<Button-1>", self._open)
+        self.bind("<Configure>", lambda _e: self._draw())
+        variable.trace_add("write", lambda *_: self._draw())
+        self._draw()
+
+    def _open(self, _event):
+        try:
+            self._menu.tk_popup(self.winfo_rootx(), self.winfo_rooty() + self.winfo_height() + 4)
+        finally:
+            self._menu.grab_release()
+
+    def _pick(self, choice):
+        self.var.set(choice)
+        if self.command:
+            self.command(choice)
+
+    def _draw(self):
+        self.delete("all")
+        w, h = self.winfo_width(), self.winfo_height()
+        if w < 4:
+            return
+        rounded_rect(self, 1, 1, w - 1, h - 1, 12, fill=SURFACE_3, outline=OUTLINE, width=1)
+        self.create_text(16, h // 2, text=self.var.get(), anchor="w", fill=TEXT, font=self._font)
+        x = w - 22
+        self.create_polygon(x - 6, h // 2 - 3, x + 6, h // 2 - 3, x, h // 2 + 4, fill=MUTED, outline="")
+
+
+class NavItem(tk.Canvas):
+    """One page button in the left rail. A pill sits behind the label when it is the current page."""
+
+    def __init__(self, parent, text, command):
+        super().__init__(parent, width=112, height=52, bg=BG, highlightthickness=0, bd=0, cursor="hand2")
+        self._text = text
+        self._command = command
+        self._selected = False
+        self._hover = False
+        self._font = tkfont.Font(family=FONT, size=10, weight="bold")
+        self.bind("<Enter>", lambda _e: self._set_hover(True))
+        self.bind("<Leave>", lambda _e: self._set_hover(False))
+        self.bind("<Button-1>", lambda _e: self._command())
+        self.bind("<Configure>", lambda _e: self._draw())
+        self._draw()
+
+    def select(self, on):
+        self._selected = on
+        self._draw()
+
+    def _set_hover(self, on):
+        self._hover = on
+        self._draw()
+
+    def _draw(self):
+        self.delete("all")
+        w, h = self.winfo_width(), self.winfo_height()
+        if w < 4:
+            return
+        if self._selected:
+            rounded_rect(self, 4, 4, w - 4, h - 4, (h - 8) // 2, fill=PRIMARY_CONTAINER, outline="")
+            fg = ON_PRIMARY_CONTAINER
+        else:
+            if self._hover:
+                rounded_rect(self, 4, 4, w - 4, h - 4, (h - 8) // 2, fill=_mix(BG, TEXT, 0.08), outline="")
+            fg = MUTED
+        self.create_text(w // 2, h // 2, text=self._text, fill=fg, font=self._font)
+
+
+class Snackbar(tk.Canvas):
+    """The status message, shown as a Material 3 snackbar along the bottom of the window."""
+
+    def __init__(self, parent):
+        super().__init__(parent, height=50, bg=BG, highlightthickness=0, bd=0)
+        self._text = ""
+        self._font = tkfont.Font(family=FONT, size=9)
+        self.bind("<Configure>", lambda _e: self._draw())
+
+    def set_text(self, text):
+        self._text = text
+        self._draw()
+
+    def _draw(self):
+        self.delete("all")
+        w, h = self.winfo_width(), self.winfo_height()
+        if w < 4:
+            return
+        rounded_rect(self, 0, 0, w, h, 16, fill=INVERSE_SURFACE, outline="")
+        self.create_text(22, h // 2, text=self._text, anchor="w", fill=INVERSE_TEXT,
+                         font=self._font, width=w - 44)
+
+
+JC_SIZE = (240, 340)  # the Joy-Con picture, in pixels
+
+BUTTON_NAMES = (
+    (BTN_A, "A"), (BTN_B, "B"), (BTN_X, "X"), (BTN_Y, "Y"),
+    (BTN_UP, "Up"), (BTN_DOWN, "Down"), (BTN_LEFT, "Left"), (BTN_RIGHT, "Right"),
+    (BTN_PLUS, "+"), (BTN_MINUS, "-"), (BTN_HOME, "Home"), (BTN_CAPTURE, "Capture"),
+    (BTN_L, "L"), (BTN_R, "R"), (BTN_ZL, "ZL"), (BTN_ZR, "ZR"),
+    (BTN_L3, "L3"), (BTN_R3, "R3"),
+    (BTN_SL_L, "SL"), (BTN_SR_L, "SR"), (BTN_SL_R, "SL"), (BTN_SR_R, "SR"),
+)
+
+
+def pressed_names(s: JoyConState) -> list:
+    """The names of the buttons held down right now on this Joy-Con."""
+    if not s.connected:
+        return []
+    names = []
+    for mask, name in BUTTON_NAMES:
+        if s.buttons & mask and name not in names:
+            names.append(name)
+    return names
+
+
+def draw_joycon(canvas, s: JoyConState, hint=()):
+    """A Joy-Con drawn with every button in its place. A held button lights up; a ringed one is a mouse click."""
     canvas.delete("all")
-    if s.side == "L":
-        rounded_rect(canvas, 126, 44, 150, 156, 10, fill=s.rail_color, outline="")
-        rounded_rect(canvas, 40, 20, 136, 180, 26, fill=s.body_color, outline=BORDER)
-        canvas.create_oval(60, 42, 96, 78, fill=s.btn_color, outline="#4B5563")
-        for dx, dy, mask in ((0, -14, BTN_UP), (0, 14, BTN_DOWN), (-14, 0, BTN_LEFT), (14, 0, BTN_RIGHT)):
-            active = s.connected and (s.buttons & mask)
-            x, y = 78 + dx, 130 + dy
-            canvas.create_oval(x - 5, y - 5, x + 5, y + 5, fill=ACTIVE_L if active else s.btn_color, outline="")
+    right = s.side == "R"
+    rounded_rect(canvas, 2, 2, JC_SIZE[0] - 2, JC_SIZE[1] - 2, 22, fill=SURFACE_2, outline="")
+
+    def lit(mask):
+        return bool(s.connected and (s.buttons & mask))
+
+    def ring(mask):
+        return WARN if mask in hint else "#4B5563"
+
+    def key(cx, cy, label, mask, r=14, size=8):
+        """A round button."""
+        on = lit(mask)
+        canvas.create_oval(cx - r, cy - r, cx + r, cy + r, fill=PRIMARY if on else s.btn_color,
+                           outline=ring(mask), width=3 if mask in hint else 1)
+        canvas.create_text(cx, cy, text=label, fill=ON_PRIMARY if on else TEXT, font=(FONT, size, "bold"))
+
+    def pill(cx, cy, hw, hh, label, mask, size=7):
+        """A pill-shaped button: shoulders, rail buttons, Home and Capture."""
+        on = lit(mask)
+        rounded_rect(canvas, cx - hw, cy - hh, cx + hw, cy + hh, min(hw, hh),
+                     fill=PRIMARY if on else s.btn_color, outline=ring(mask), width=3 if mask in hint else 1)
+        canvas.create_text(cx, cy, text=label, fill=ON_PRIMARY if on else TEXT, font=(FONT, size, "bold"))
+
+    def stick(cx, cy, r, mask, label):
+        """The stick well: its dot follows the stick, and the well lights up when the stick is pressed in."""
+        on = lit(mask)
+        canvas.create_oval(cx - r, cy - r, cx + r, cy + r,
+                           fill=PRIMARY_CONTAINER if on else SURFACE_3, outline=OUTLINE)
+        nx = max(-1.0, min(1.0, (s.stick_x - s.center_x) / 1750.0)) if s.connected else 0.0
+        ny = max(-1.0, min(1.0, (s.stick_y - s.center_y) / 1750.0)) if s.connected else 0.0
+        px, py = cx + nx * (r - 12), cy - ny * (r - 12)
+        colour = PRIMARY if s.connected else MUTED
+        canvas.create_oval(px - 9, py - 9, px + 9, py + 9, fill=colour, outline="")
+        canvas.create_text(cx, cy + r + 12, text=label, fill=MUTED, font=(FONT, 7, "bold"))
+
+    # Shoulder buttons sit on top of the body
+    if right:
+        pill(171, 27, 33, 13, "R", BTN_R)
+        pill(99, 27, 29, 13, "ZR", BTN_ZR)
+        body_x1, body_x2 = 44, 226
+        rail_x1, rail_x2 = 8, 52
+        rail_x = 30
     else:
-        rounded_rect(canvas, 30, 44, 54, 156, 10, fill=s.rail_color, outline="")
-        rounded_rect(canvas, 44, 20, 140, 180, 26, fill=s.body_color, outline=BORDER)
-        for dx, dy, mask in ((0, -14, BTN_X), (0, 14, BTN_B), (-14, 0, BTN_Y), (14, 0, BTN_A)):
-            active = s.connected and (s.buttons & mask)
-            x, y = 92 + dx, 62 + dy
-            canvas.create_oval(x - 5, y - 5, x + 5, y + 5, fill=ACTIVE_R if active else s.btn_color, outline="")
-        canvas.create_oval(74, 110, 110, 146, fill=s.btn_color, outline="#4B5563")
+        pill(69, 27, 33, 13, "L", BTN_L)
+        pill(141, 27, 29, 13, "ZL", BTN_ZL)
+        body_x1, body_x2 = 14, 196
+        rail_x1, rail_x2 = 188, 232
+        rail_x = 210
+    rounded_rect(canvas, body_x1, 34, body_x2, 326, 46, fill=s.body_color, outline=BORDER, width=2)
+    rounded_rect(canvas, rail_x1, 56, rail_x2, 304, 16, fill=s.rail_color, outline="")
+
+    # Rail: SL and SR on the inside of the rail, and the SYNC button
+    if right:
+        pill(rail_x, 107, 11, 13, "SL", BTN_SL_R, 6)
+        pill(rail_x, 245, 11, 13, "SR", BTN_SR_R, 6)
+    else:
+        pill(rail_x, 107, 11, 13, "SL", BTN_SL_L, 6)
+        pill(rail_x, 245, 11, 13, "SR", BTN_SR_L, 6)
+    canvas.create_oval(rail_x - 6, 66, rail_x + 6, 78, fill=s.btn_color, outline=OUTLINE)  # SYNC
+
+    if right:
+        key(196, 115, "A", BTN_A)
+        key(160, 151, "B", BTN_B)
+        key(160, 79, "X", BTN_X)
+        key(124, 115, "Y", BTN_Y)
+        key(92, 70, "+", BTN_PLUS, r=12)
+        pill(92, 104, 17, 11, "HOME", BTN_HOME, 6)
+        stick(118, 246, 38, BTN_R3, "R3")
+    else:
+        key(80, 79, "↑", BTN_UP, r=12)
+        key(80, 151, "↓", BTN_DOWN, r=12)
+        key(44, 115, "←", BTN_LEFT, r=12)
+        key(116, 115, "→", BTN_RIGHT, r=12)
+        key(146, 72, "-", BTN_MINUS, r=12)
+        pill(152, 108, 19, 11, "CAPTURE", BTN_CAPTURE, 6)
+        stick(122, 246, 38, BTN_L3, "L3")
 
 
-def draw_stick(canvas, s: JoyConState):
-    canvas.delete("all")
-    cx, cy, r = 90, 88, 62
-    canvas.create_oval(cx - r, cy - r, cx + r, cy + r, outline=BORDER, width=2)
-    canvas.create_oval(cx - r // 2, cy - r // 2, cx + r // 2, cy + r // 2, outline=BORDER)
-    canvas.create_line(cx - r, cy, cx + r, cy, fill=BORDER)
-    canvas.create_line(cx, cy - r, cx, cy + r, fill=BORDER)
-    nx = max(-1.0, min(1.0, (s.stick_x - s.center_x) / 1750.0)) if s.connected else 0.0
-    ny = max(-1.0, min(1.0, (s.stick_y - s.center_y) / 1750.0)) if s.connected else 0.0
-    px = cx + int(nx * (r - 8))
-    py = cy - int(ny * (r - 8))
-    dot = s.rail_color if s.connected else MUTED
-    canvas.create_line(cx, cy, px, py, fill=dot, width=2)
-    canvas.create_oval(px - 8, py - 8, px + 8, py + 8, fill=dot, outline=TEXT)
-    canvas.create_text(cx, 186, text=f"Stick {s.stick_x:4d}, {s.stick_y:4d}", fill=MUTED, font=(MONO, 8))
+class JoyConCard(Card):
+    """One Joy-Con: a picture with every button, the buttons held right now, live readings and colour settings."""
 
-
-class JoyConCard(tk.Frame):
-    """One Joy-Con: status, battery, shell preview, stick, colors, and motion readout."""
-
-    def __init__(self, parent, title: str, state: JoyConState):
-        super().__init__(parent, bg=SURFACE, highlightthickness=1, highlightbackground=BORDER, bd=0)
-        self.state = state
+    def __init__(self, parent, title: str, state: JoyConState, manager):
+        super().__init__(parent, bg=BG, fill=SURFACE, pad=18, radius=24)
+        self.joycon = state
         self.side = state.side
-        pad = 16
+        self.manager = manager
+        body = self.body
 
-        header = tk.Frame(self, bg=SURFACE)
-        header.pack(fill="x", padx=pad, pady=(14, 6))
-        tk.Label(header, text=title, font=(FONT, 11, "bold"), fg=TEXT, bg=SURFACE).pack(side="left")
-        self.status_lbl = make_pill(header, "WAITING", MUTED, SURFACE_2)
+        head = tk.Frame(body, bg=SURFACE)
+        head.pack(fill="x")
+        tk.Label(head, text=title, font=(FONT, 12, "bold"), fg=TEXT, bg=SURFACE).pack(side="left")
+        self.status_lbl = make_chip(head, "WAITING", SECONDARY_CONTAINER, ON_SECONDARY_CONTAINER)
         self.status_lbl.pack(side="right")
+        self.role_lbl = make_chip(head, "", SURFACE, ON_PRIMARY_CONTAINER)
+        self.role_lbl.pack(side="right", padx=(0, 8))
 
-        battery = tk.Frame(self, bg=SURFACE)
-        battery.pack(fill="x", padx=pad, pady=(4, 10))
-        top = tk.Frame(battery, bg=SURFACE)
+        row = tk.Frame(body, bg=SURFACE)
+        row.pack(fill="x", pady=(12, 0))
+        self.picture = tk.Canvas(row, width=JC_SIZE[0], height=JC_SIZE[1], bg=SURFACE, highlightthickness=0, bd=0)
+        self.picture.pack(side="left", anchor="n")
+
+        column = tk.Frame(row, bg=SURFACE)
+        column.pack(side="left", fill="both", expand=True, padx=(14, 0))
+        top = tk.Frame(column, bg=SURFACE)
         top.pack(fill="x")
-        self.bat_text = tk.Label(top, text="Battery --", font=(FONT, 9), fg=TEXT, bg=SURFACE)
+        self.bat_text = tk.Label(top, text="Battery --", font=(FONT, 9), fg=MUTED, bg=SURFACE)
         self.bat_text.pack(side="left")
         self.charge_lbl = tk.Label(top, text="", font=(FONT, 9, "bold"), fg=GOOD, bg=SURFACE)
         self.charge_lbl.pack(side="right")
-        self.bat_canvas = tk.Canvas(battery, width=120, height=12, bg=SURFACE_2, highlightthickness=0)
-        self.bat_canvas.pack(fill="x", pady=(6, 0))
+        self.bat_canvas = tk.Canvas(column, width=170, height=8, bg=SURFACE_3, highlightthickness=0, bd=0)
+        self.bat_canvas.pack(fill="x", pady=(5, 0))
+        self.pressed_lbl = tk.Label(column, text="Held: nothing", font=(FONT, 9), fg=TEXT, bg=SURFACE,
+                                    justify="left", anchor="w", wraplength=170)
+        self.pressed_lbl.pack(fill="x", pady=(14, 0))
+        self.stick_lbl = tk.Label(column, text="Stick  2048, 2048", font=(MONO, 9), fg=MUTED, bg=SURFACE, anchor="w")
+        self.stick_lbl.pack(fill="x", pady=(6, 0))
+        self.click_lbl = tk.Label(column, text="", font=(FONT, 8), fg=WARN, bg=SURFACE,
+                                  justify="left", anchor="w", wraplength=170)
+        self.click_lbl.pack(fill="x", pady=(10, 0))
 
-        visuals = tk.Frame(self, bg=SURFACE)
-        visuals.pack(fill="x", padx=pad)
-        self.shell_canvas = tk.Canvas(visuals, width=180, height=200, bg=SURFACE_2, highlightthickness=0)
-        self.shell_canvas.pack(side="left", expand=True)
-        self.stick_canvas = tk.Canvas(visuals, width=180, height=200, bg=SURFACE_2, highlightthickness=0)
-        self.stick_canvas.pack(side="right", expand=True)
-
-        colors = tk.Frame(self, bg=SURFACE)
-        colors.pack(fill="x", padx=pad, pady=(12, 0))
-        make_button(colors, "Theme", self._cycle_theme, size=8, padx=8, pady=3).pack(side="left", padx=(0, 4))
-        for label, attr in (("Body", "body_color"), ("Buttons", "btn_color"), ("Rail", "rail_color")):
-            make_button(
-                colors, label, lambda a=attr, t=label: self._pick_color(a, t), size=8, padx=8, pady=3
-            ).pack(side="left", padx=2)
-        make_button(
-            colors, "Test rumble", lambda: self.state.rumble_request(), style="primary", size=8, padx=8, pady=3
-        ).pack(side="right")
-
-        motion = tk.Frame(self, bg=SURFACE_2)
-        motion.pack(fill="x", padx=pad, pady=(10, 14))
-        tk.Label(motion, text="MOTION  (gyro, deg/s)", font=(FONT, 8, "bold"), fg=MUTED, bg=SURFACE_2).pack(
-            anchor="w", padx=12, pady=(8, 4)
-        )
-        grid = tk.Frame(motion, bg=SURFACE_2)
-        grid.pack(fill="x", padx=12)
+        motion = Card(column, bg=SURFACE, fill=SURFACE_2, pad=10, radius=14)
+        motion.pack(fill="x", pady=(12, 0))
+        mb = motion.body
+        tk.Label(mb, text="Motion (deg/s)", font=(FONT, 8, "bold"), fg=MUTED, bg=SURFACE_2).pack(anchor="w")
         self.gyro_rows = {}
-        for col, axis in enumerate(("X", "Y", "Z")):
-            cell = tk.Frame(grid, bg=SURFACE_2)
-            cell.pack(side="left", fill="x", expand=True, padx=(0, 10) if col < 2 else (0, 0))
-            tk.Label(cell, text=axis, width=2, anchor="w", font=(MONO, 9), fg=TEXT, bg=SURFACE_2).pack(side="left")
-            bar = tk.Canvas(cell, width=30, height=8, bg=SURFACE, highlightthickness=0)
-            bar.pack(side="left", fill="x", expand=True, padx=(4, 4))
-            val = tk.Label(cell, text="+0.0", width=6, anchor="e", font=(MONO, 9), fg=MUTED, bg=SURFACE_2)
+        for axis in ("X", "Y", "Z"):
+            line = tk.Frame(mb, bg=SURFACE_2)
+            line.pack(fill="x", pady=(4, 0))
+            tk.Label(line, text=axis, width=2, anchor="w", font=(MONO, 8), fg=TEXT, bg=SURFACE_2).pack(side="left")
+            bar = tk.Canvas(line, width=80, height=8, bg=SURFACE_3, highlightthickness=0, bd=0)
+            bar.pack(side="left", fill="x", expand=True, padx=(4, 6))
+            val = tk.Label(line, text="+0.0", width=6, anchor="e", font=(MONO, 8), fg=MUTED, bg=SURFACE_2)
             val.pack(side="left")
             self.gyro_rows[axis] = (bar, val)
-        self.accel_lbl = tk.Label(
-            motion, text="Accel X +0.00  Y +0.00  Z +0.00 g", font=(MONO, 8), fg=MUTED, bg=SURFACE_2
-        )
-        self.accel_lbl.pack(anchor="w", padx=12, pady=(6, 10))
+        tk.Label(mb, text="Accel (g)", font=(FONT, 8, "bold"), fg=MUTED, bg=SURFACE_2).pack(anchor="w", pady=(8, 0))
+        accel_row = tk.Frame(mb, bg=SURFACE_2)
+        accel_row.pack(fill="x", pady=(2, 0))
+        self.accel_lbls = []
+        for _axis in ("X", "Y", "Z"):
+            label = tk.Label(accel_row, text=f"{_axis} +0.00", font=(MONO, 7), fg=MUTED, bg=SURFACE_2)
+            label.pack(side="left", padx=(0, 3))
+            self.accel_lbls.append(label)
+
+        colors = tk.Frame(body, bg=SURFACE)
+        colors.pack(fill="x", pady=(14, 0))
+        M3Button(colors, "Theme", self._cycle_theme, style="outlined", bg=SURFACE, compact=True).pack(
+            side="left", padx=(0, 6))
+        for text, attr in (("Body", "body_color"), ("Buttons", "btn_color"), ("Rail", "rail_color")):
+            M3Button(colors, text, lambda a=attr, t=text: self._pick_color(a, t), style="text",
+                     bg=SURFACE, compact=True).pack(side="left")
+        M3Button(colors, "Test rumble", lambda: self.joycon.rumble_request(), style="filled",
+                 bg=SURFACE, compact=True).pack(side="right")
 
     def _cycle_theme(self):
-        self.state.apply_theme(self.state.theme_idx + 1)
+        self.joycon.apply_theme(self.joycon.theme_idx + 1)
 
     def _pick_color(self, attr: str, label: str):
         # Display-only: changes the on-screen preview, not the controller's stored colors.
-        current = getattr(self.state, attr)
+        current = getattr(self.joycon, attr)
         chosen = colorchooser.askcolor(color=current, title=f"Pick {self.side} Joy-Con {label} color")
         if chosen and chosen[1]:
-            setattr(self.state, attr, chosen[1])
+            setattr(self.joycon, attr, chosen[1])
 
     def refresh(self):
-        s = self.state
+        s = self.joycon
+        m = self.manager
         if s.connected:
-            self.status_lbl.config(text="CONNECTED", fg=GOOD, bg=GOOD_BG)
+            self.status_lbl.config(text="CONNECTED", fg=ON_GOOD_CONTAINER, bg=GOOD_CONTAINER)
         else:
-            self.status_lbl.config(text="WAITING", fg=MUTED, bg=SURFACE_2)
+            self.status_lbl.config(text="WAITING", fg=ON_SECONDARY_CONTAINER, bg=SECONDARY_CONTAINER)
+
+        role = ""
+        if s.connected:
+            if m._is_mouse(s):
+                role = "Mouse"
+            elif m.sideways_single and m.active_side == self.side:
+                role = "Sideways"
+            elif m.mouse_enabled and m.auto_mode:
+                role = "Controller"
+        if role == "Controller":
+            self.role_lbl.config(text=role, bg=SECONDARY_CONTAINER, fg=ON_SECONDARY_CONTAINER)
+        else:
+            self.role_lbl.config(text=role, bg=PRIMARY_CONTAINER if role else SURFACE, fg=ON_PRIMARY_CONTAINER)
 
         self.bat_canvas.delete("all")
         w = max(1, self.bat_canvas.winfo_width())
         if s.connected and s.battery_bars > 0:
-            self.bat_text.config(text=f"Battery {s.battery_pct}%   (level {s.battery_bars} of 8)")
+            self.bat_text.config(text=f"Battery {s.battery_pct}%")
             fill = int(w * s.battery_pct / 100.0)
             color = GOOD if s.battery_pct > 40 else (WARN if s.battery_pct > 15 else BAD)
-            self.bat_canvas.create_rectangle(0, 0, fill, 12, fill=color, width=0)
+            self.bat_canvas.create_rectangle(0, 0, fill, 8, fill=color, width=0)
         elif s.connected:
             self.bat_text.config(text="Battery reading...")
         else:
             self.bat_text.config(text="Battery --")
         self.charge_lbl.config(text="Charging" if (s.connected and s.charging) else "")
 
-        draw_shell(self.shell_canvas, s)
-        draw_stick(self.stick_canvas, s)
+        names = pressed_names(s)
+        self.pressed_lbl.config(text="Held: " + (", ".join(names) if names else "nothing"))
+        self.stick_lbl.config(text=f"Stick  {s.stick_x:4d}, {s.stick_y:4d}")
+        hint = ()
+        if m.mouse_enabled:
+            hint = CLICK_BUTTONS[self.side]
+            left_name, right_name = ("ZR", "R") if self.side == "R" else ("ZL", "L")
+            self.click_lbl.config(text=f"Mouse: {left_name} = left click, {right_name} = right click")
+        else:
+            self.click_lbl.config(text="")
+        draw_joycon(self.picture, s, hint)
 
         for axis, val in (("X", s.gyro_x), ("Y", s.gyro_y), ("Z", s.gyro_z)):
             bar, label = self.gyro_rows[axis]
@@ -1168,15 +1808,14 @@ class JoyConCard(tk.Frame):
             bar.delete("all")
             bw = max(1, bar.winfo_width())
             mid = bw // 2
-            bar.create_line(mid, 0, mid, 8, fill=BORDER)
+            bar.create_line(mid, 0, mid, 8, fill=OUTLINE)
             if s.connected:
                 norm = max(-1.0, min(1.0, val / 250.0))
                 end = mid + int(norm * mid)
                 bar.create_rectangle(min(mid, end), 1, max(mid, end), 7, fill=ACCENT, width=0)
 
-        self.accel_lbl.config(
-            text=f"Accel  X {s.accel_x:+.2f}  Y {s.accel_y:+.2f}  Z {s.accel_z:+.2f} g"
-        )
+        for axis, label, value in zip(("X", "Y", "Z"), self.accel_lbls, (s.accel_x, s.accel_y, s.accel_z)):
+            label.config(text=f"{axis} {value:+.2f}")
 
 
 # --- ViGEmBus driver: the virtual controller needs it ---------------------------
@@ -1307,7 +1946,7 @@ def install_vigembus_driver(log, progress) -> bool:
 
 # --- Update check: asks GitHub for the newest release ---------------------------
 
-APP_VERSION = "0.2.0"
+APP_VERSION = "0.2.8"
 UPDATE_API = "https://api.github.com/repos/lexluther1307-sudo/Joy-con-2-Studio/releases/latest"
 RELEASES_PAGE = "https://github.com/lexluther1307-sudo/Joy-con-2-Studio/releases/latest"
 
@@ -1334,43 +1973,257 @@ def check_for_update() -> tuple[bool, str, str]:
     return newer, latest, release.get("html_url") or RELEASES_PAGE
 
 
+# --- Keeping the app running: a tray icon, and a second copy that shows the running window ------------
+
+SHOW_PORT = 26790  # a second copy connects here, asks the running copy to show its window, and exits
+TRAY_CLASS = "JoyCon2StudioTray"
+WM_APP = 0x8000
+WM_TRAY = WM_APP + 1  # the tray icon sends this to our hidden window when it is clicked
+WM_COMMAND = 0x0111
+WM_LBUTTONUP = 0x0202
+WM_RBUTTONUP = 0x0205
+NIM_ADD, NIM_DELETE = 0, 2
+NIF_MESSAGE, NIF_ICON, NIF_TIP = 0x1, 0x2, 0x4
+MF_STRING = 0x0000
+TPM_RIGHTBUTTON = 0x0002
+IDM_SHOW, IDM_QUIT = 1001, 1002
+_WNDPROC = ctypes.WINFUNCTYPE(ctypes.c_ssize_t, ctypes.c_void_p, ctypes.c_uint, ctypes.c_size_t, ctypes.c_ssize_t)
+
+
+class _WNDCLASSEXW(ctypes.Structure):
+    _fields_ = [
+        ("cbSize", ctypes.c_uint), ("style", ctypes.c_uint), ("lpfnWndProc", _WNDPROC),
+        ("cbClsExtra", ctypes.c_int), ("cbWndExtra", ctypes.c_int), ("hInstance", ctypes.c_void_p),
+        ("hIcon", ctypes.c_void_p), ("hCursor", ctypes.c_void_p), ("hbrBackground", ctypes.c_void_p),
+        ("lpszMenuName", ctypes.c_wchar_p), ("lpszClassName", ctypes.c_wchar_p), ("hIconSm", ctypes.c_void_p),
+    ]
+
+
+class _NOTIFYICONDATAW(ctypes.Structure):
+    _fields_ = [
+        ("cbSize", ctypes.c_uint), ("hWnd", ctypes.c_void_p), ("uID", ctypes.c_uint), ("uFlags", ctypes.c_uint),
+        ("uCallbackMessage", ctypes.c_uint), ("hIcon", ctypes.c_void_p), ("szTip", ctypes.c_wchar * 128),
+        ("dwState", ctypes.c_uint), ("dwStateMask", ctypes.c_uint), ("szInfo", ctypes.c_wchar * 256),
+        ("uTimeoutOrVersion", ctypes.c_uint), ("szInfoTitle", ctypes.c_wchar * 64),
+        ("dwInfoFlags", ctypes.c_uint), ("guidItem", ctypes.c_byte * 16), ("hBalloonIcon", ctypes.c_void_p),
+    ]
+
+
+class _POINT(ctypes.Structure):
+    _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
+
+
+class _MSG(ctypes.Structure):
+    _fields_ = [("hwnd", ctypes.c_void_p), ("message", ctypes.c_uint), ("wParam", ctypes.c_size_t),
+                ("lParam", ctypes.c_ssize_t), ("time", ctypes.c_uint), ("pt", _POINT)]
+
+
+class TrayIcon:
+    """An icon in the notification area with Show and Quit. A hidden window on its own thread receives its
+    clicks and passes "show" or "quit" to the app through a queue."""
+
+    def __init__(self, tip: str, events: queue.Queue):
+        self.tip = tip
+        self.events = events
+        self._hwnd = None
+        self._user32 = None
+        self._shell32 = None
+        self._data = None
+        self._proc = _WNDPROC(self._on_message)  # kept alive for as long as the window exists
+        self._ready = threading.Event()
+        threading.Thread(target=self._run, daemon=True).start()
+        self._ready.wait(5)
+
+    def _run(self):
+        user32 = ctypes.WinDLL("user32", use_last_error=True)
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        shell32 = ctypes.WinDLL("shell32", use_last_error=True)
+        self._user32, self._shell32 = user32, shell32
+        kernel32.GetModuleHandleW.restype = ctypes.c_void_p
+        kernel32.GetModuleHandleW.argtypes = [ctypes.c_wchar_p]
+        user32.RegisterClassExW.argtypes = [ctypes.c_void_p]
+        user32.CreateWindowExW.restype = ctypes.c_void_p
+        user32.CreateWindowExW.argtypes = [ctypes.c_uint, ctypes.c_wchar_p, ctypes.c_wchar_p, ctypes.c_uint,
+                                           ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                                           ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p]
+        user32.DefWindowProcW.restype = ctypes.c_ssize_t
+        user32.DefWindowProcW.argtypes = [ctypes.c_void_p, ctypes.c_uint, ctypes.c_size_t, ctypes.c_ssize_t]
+        user32.LoadIconW.restype = ctypes.c_void_p
+        user32.LoadIconW.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        shell32.ExtractIconW.restype = ctypes.c_void_p
+        shell32.ExtractIconW.argtypes = [ctypes.c_void_p, ctypes.c_wchar_p, ctypes.c_uint]
+        shell32.Shell_NotifyIconW.argtypes = [ctypes.c_uint, ctypes.c_void_p]
+        user32.CreatePopupMenu.restype = ctypes.c_void_p
+        user32.AppendMenuW.argtypes = [ctypes.c_void_p, ctypes.c_uint, ctypes.c_size_t, ctypes.c_wchar_p]
+        user32.TrackPopupMenu.argtypes = [ctypes.c_void_p, ctypes.c_uint, ctypes.c_int, ctypes.c_int,
+                                          ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p]
+        user32.DestroyMenu.argtypes = [ctypes.c_void_p]
+        user32.SetForegroundWindow.argtypes = [ctypes.c_void_p]
+        user32.PostMessageW.argtypes = [ctypes.c_void_p, ctypes.c_uint, ctypes.c_size_t, ctypes.c_ssize_t]
+
+        instance = kernel32.GetModuleHandleW(None)
+        window_class = _WNDCLASSEXW()
+        window_class.cbSize = ctypes.sizeof(window_class)
+        window_class.lpfnWndProc = self._proc
+        window_class.hInstance = instance
+        window_class.lpszClassName = TRAY_CLASS
+        user32.RegisterClassExW(ctypes.byref(window_class))
+        self._hwnd = user32.CreateWindowExW(0, TRAY_CLASS, TRAY_CLASS, 0, 0, 0, 0, 0, None, None, instance, None)
+
+        icon = shell32.ExtractIconW(None, sys.executable, 0) or user32.LoadIconW(None, ctypes.c_void_p(32512))
+        self._data = _NOTIFYICONDATAW()
+        self._data.cbSize = ctypes.sizeof(self._data)
+        self._data.hWnd = self._hwnd
+        self._data.uID = 1
+        self._data.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP
+        self._data.uCallbackMessage = WM_TRAY
+        self._data.hIcon = icon
+        self._data.szTip = self.tip[:127]
+        shell32.Shell_NotifyIconW(NIM_ADD, ctypes.byref(self._data))
+        self._ready.set()
+
+        message = _MSG()
+        while user32.GetMessageW(ctypes.byref(message), None, 0, 0) > 0:
+            user32.TranslateMessage(ctypes.byref(message))
+            user32.DispatchMessageW(ctypes.byref(message))
+
+    def _on_message(self, hwnd, message, wparam, lparam):
+        if message == WM_TRAY:
+            event = int(lparam) & 0xFFFF
+            if event == WM_LBUTTONUP:
+                self.events.put("show")
+            elif event == WM_RBUTTONUP:
+                self._show_menu(hwnd)
+            return 0
+        if message == WM_COMMAND:
+            command = int(wparam) & 0xFFFF
+            if command == IDM_SHOW:
+                self.events.put("show")
+            elif command == IDM_QUIT:
+                self.events.put("quit")
+            return 0
+        return self._user32.DefWindowProcW(hwnd, message, wparam, lparam)
+
+    def _show_menu(self, hwnd):
+        user32 = self._user32
+        menu = user32.CreatePopupMenu()
+        user32.AppendMenuW(menu, MF_STRING, IDM_SHOW, "Show")
+        user32.AppendMenuW(menu, MF_STRING, IDM_QUIT, "Quit")
+        point = _POINT()
+        user32.GetCursorPos(ctypes.byref(point))
+        user32.SetForegroundWindow(hwnd)
+        user32.TrackPopupMenu(menu, TPM_RIGHTBUTTON, point.x, point.y, 0, hwnd, None)
+        user32.PostMessageW(hwnd, 0, 0, 0)  # lets the menu close when the mouse is clicked elsewhere
+        user32.DestroyMenu(menu)
+
+    def remove(self):
+        """Takes the icon out of the notification area."""
+        if self._data is not None:
+            self._shell32.Shell_NotifyIconW(NIM_DELETE, ctypes.byref(self._data))
+
+
+def start_show_server(on_show) -> bool:
+    """Lets a second copy of the app show this window instead of starting another copy."""
+    try:
+        server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        server.bind(("127.0.0.1", SHOW_PORT))
+        server.listen(4)
+    except OSError:
+        return False
+
+    def serve():
+        while True:
+            try:
+                conn, _ = server.accept()
+            except OSError:
+                return
+            with conn:
+                conn.settimeout(2.0)
+                try:
+                    if conn.recv(16).startswith(b"show"):
+                        on_show()
+                except OSError:
+                    pass
+
+    threading.Thread(target=serve, daemon=True).start()
+    return True
+
+
+def ask_running_copy_to_show() -> bool:
+    """True when another copy of the app is running, and it has been asked to show its window."""
+    try:
+        with socket.create_connection(("127.0.0.1", SHOW_PORT), timeout=1.0) as conn:
+            conn.sendall(b"show")
+        return True
+    except OSError:
+        return False
+
+
 class JoyCon2App(tk.Tk):
     def __init__(self):
         super().__init__()
+        self._status_queue = queue.Queue()
         self.title("Joy-Con 2 Studio")
-        self.geometry("1000x770")
-        self.minsize(940, 720)
+        self.geometry("1080x740")
+        self.minsize(1000, 700)
         self.configure(bg=BG)
 
         self.status_var = tk.StringVar(value="Hold SYNC on one or two Joy-Cons, then click Scan.")
         self.manager = JoyCon2Manager(self._set_status)
 
         self._build_header()
-        self._build_toolbar()
-        self._build_status_bar()
-        self._build_tools()
-        self._build_cards()
+        self._build_body()
+        self._build_snackbar()
         self._refresh_virtual_pill()
+        self._events = queue.Queue()
+        self._quitting = False
+        self._tray = None
+        try:
+            self._tray = TrayIcon("Joy-Con 2 Studio", self._events)
+            if self._tray._hwnd is None:
+                self._tray = None
+        except Exception:
+            self._tray = None
+        if self._tray is not None:
+            self.protocol("WM_DELETE_WINDOW", self._close_to_tray)  # the close button keeps the app running
+        else:
+            self.protocol("WM_DELETE_WINDOW", self._quit)  # no tray icon: closing quits, as before
+        start_show_server(lambda: self._events.put("show"))
         self.after(1000, lambda: self._start_update_check(manual=False))  # once the window is up
         self._tick()
         if self.auto_scan_var.get():
             self.manager.start_scan(12.0)
 
     def _set_status(self, msg: str):
-        self.after(0, lambda: self.status_var.set(msg))
+        # Safe from the link and Bluetooth threads: the window picks the text up in _tick
+        self._status_queue.put(msg)
+
+    def _drain_status(self):
+        while True:
+            try:
+                msg = self._status_queue.get_nowait()
+            except queue.Empty:
+                return
+            self.status_var.set(msg)
+
+    def _pill(self, text, bg, fg):
+        self.virtual_pill.config(text=text, bg=bg, fg=fg)
 
     def _refresh_virtual_pill(self):
         if HAS_VGAMEPAD and vigembus_installed():
-            if vigembus_running():
-                self.virtual_pill.config(text="Virtual controller: READY", fg=GOOD, bg=GOOD_BG)
+            if self.manager.deck_connected():
+                # The Deck has the controller, so this PC does not use it
+                self._pill("Virtual controller: off (Deck connected)", SECONDARY_CONTAINER, ON_SECONDARY_CONTAINER)
+            elif vigembus_running():
+                self._pill("Virtual controller: READY", GOOD_CONTAINER, ON_GOOD_CONTAINER)
             else:
                 # Installed but not active yet. A restart finishes it, but nothing requires one.
-                self.virtual_pill.config(text="Virtual controller: restart suggested", fg=WARN, bg=SURFACE_2)
+                self._pill("Virtual controller: restart suggested", WARN_CONTAINER, ON_WARN_CONTAINER)
             self.install_btn.pack_forget()
         else:
-            self.virtual_pill.config(text="Virtual controller: MISSING ViGEmBus", fg=WARN, bg=SURFACE_2)
+            self._pill("Virtual controller: MISSING ViGEmBus", ERROR_CONTAINER, ON_ERROR_CONTAINER)
             if HAS_VGAMEPAD:
-                self.install_btn.pack(side="left", padx=8)
+                self.install_btn.pack(side="left", padx=(8, 0))
             else:
                 self.install_btn.pack_forget()
 
@@ -1427,204 +2280,307 @@ class JoyCon2App(tk.Tk):
         self.update_btn.config(text=f"Get {latest}", command=lambda: webbrowser.open(url))
         self._set_status(f"Update available: {latest} (you have {APP_VERSION}). Use the Get {latest} button.")
 
+    # ---- layout ---------------------------------------------------------------------
+
     def _build_header(self):
         head = tk.Frame(self, bg=BG)
-        head.pack(fill="x", padx=16, pady=(14, 0))
-        tk.Label(head, text="Joy-Con 2 Studio", font=(FONT, 16, "bold"), fg=TEXT, bg=BG).pack(side="left")
-        tk.Label(head, text="controller tools", font=(FONT, 10), fg=MUTED, bg=BG).pack(
-            side="left", padx=(10, 0), pady=(5, 0)
-        )
-        self.virtual_pill = make_pill(head, "", WARN, SURFACE_2)
+        head.pack(side="top", fill="x", padx=24, pady=(18, 6))
+        tk.Label(head, text="Joy-Con 2 Studio", font=(FONT, 18, "bold"), fg=TEXT, bg=BG).pack(side="left")
+        tk.Label(head, text=f"v{APP_VERSION}", font=(FONT, 10), fg=MUTED, bg=BG).pack(
+            side="left", padx=(10, 0), pady=(6, 0))
+        self.deck_chip = make_chip(head, "Deck: off", SECONDARY_CONTAINER, ON_SECONDARY_CONTAINER)
+        self.deck_chip.pack(side="right", padx=(8, 0))
+        self.virtual_pill = make_chip(head, "", WARN_CONTAINER, ON_WARN_CONTAINER)
         self.virtual_pill.pack(side="right")
 
-    def _build_toolbar(self):
-        bar = tk.Frame(self, bg=BG)
-        bar.pack(fill="x", padx=16, pady=(14, 0))
-        make_button(
-            bar, "Scan for Joy-Cons", lambda: self.manager.start_scan(12.0), style="primary", padx=14, pady=7
-        ).pack(side="left")
-        make_button(bar, "Zero sticks & gyro", self._calibrate_all, padx=12, pady=7).pack(side="left", padx=8)
-        make_button(bar, "Disconnect all", self.manager.disconnect_all, style="danger", padx=12, pady=7).pack(
-            side="left"
-        )
-        self.install_btn = make_button(
-            bar, "Install ViGEmBus driver", self._install_vigembus, style="primary", padx=12, pady=7
-        )
-        self.update_btn = make_button(
-            bar, "Check for updates", lambda: self._start_update_check(manual=True), padx=12, pady=7
-        )
-        self.update_btn.pack(side="right")
+    def _build_body(self):
+        row = tk.Frame(self, bg=BG)
+        row.pack(side="top", fill="both", expand=True, padx=16, pady=(8, 8))
+        rail = tk.Frame(row, bg=BG)
+        rail.pack(side="left", fill="y", padx=(8, 8), pady=(6, 0))
+        self.pages = {}
+        self.nav = {}
+        for name, text in (("controllers", "Controllers"), ("deck", "Steam Deck"), ("settings", "Settings")):
+            item = NavItem(rail, text, lambda n=name: self._show_page(n))
+            item.pack(anchor="n", pady=2)
+            self.nav[name] = item
+        self.page_area = tk.Frame(row, bg=BG)
+        self.page_area.pack(side="left", fill="both", expand=True, padx=(8, 8))
+        self._build_controllers_page()
+        self._build_deck_page()
+        self._build_settings_page()
+        self._show_page("controllers")
+        if self.bridge_var.get():
+            self._toggle_bridge()  # connects with the saved address and code
 
-    def _build_status_bar(self):
-        bar = tk.Frame(self, bg=SURFACE, padx=16, pady=7)
-        bar.pack(side="bottom", fill="x")
-        tk.Label(bar, textvariable=self.status_var, font=(FONT, 9), fg=MUTED, bg=SURFACE).pack(side="left")
+    def _show_page(self, name: str):
+        for key, page in self.pages.items():
+            if key == name:
+                page.pack(fill="both", expand=True)
+            else:
+                page.pack_forget()
+        for key, item in self.nav.items():
+            item.select(key == name)
 
-    def _build_tools(self):
-        panel = tk.Frame(self, bg=SURFACE_2, highlightthickness=1, highlightbackground=BORDER)
-        panel.pack(side="bottom", fill="x", padx=16, pady=(0, 10))
+    def _build_snackbar(self):
+        self.snack = Snackbar(self)
+        self.snack.pack(side="bottom", fill="x", padx=24, pady=(0, 16))
+        self.status_var.trace_add("write", lambda *_: self.snack.set_text(self.status_var.get()))
+        self.snack.set_text(self.status_var.get())
 
-        def section(title):
-            frame = tk.Frame(panel, bg=SURFACE_2)
-            frame.pack(side="left", fill="both", expand=True, padx=18, pady=14)
-            tk.Label(frame, text=title, font=(FONT, 8, "bold"), fg=MUTED, bg=SURFACE_2).pack(anchor="w")
-            return frame
+    def _build_controllers_page(self):
+        page = tk.Frame(self.page_area, bg=BG)
+        self.pages["controllers"] = page
+        actions = tk.Frame(page, bg=BG)
+        actions.pack(fill="x", pady=(4, 14))
+        M3Button(actions, "Scan for Joy-Cons", lambda: self.manager.start_scan(12.0),
+                 style="filled", bg=BG).pack(side="left")
+        M3Button(actions, "Zero sticks & gyro", self._calibrate_all, style="tonal", bg=BG).pack(side="left", padx=8)
+        M3Button(actions, "Disconnect all", self.manager.disconnect_all, style="danger", bg=BG).pack(side="left")
+        self.install_btn = M3Button(actions, "Install ViGEmBus driver", self._install_vigembus,
+                                    style="tonal", bg=BG)
+        cards = tk.Frame(page, bg=BG)
+        cards.pack(fill="both", expand=True)
+        cards.grid_columnconfigure(0, weight=1, uniform="cards")
+        cards.grid_columnconfigure(1, weight=1, uniform="cards")
+        self.left_card = JoyConCard(cards, "Left Joy-Con 2", self.manager.left, self.manager)
+        self.left_card.grid(row=0, column=0, sticky="new", padx=(0, 8))
+        self.right_card = JoyConCard(cards, "Right Joy-Con 2", self.manager.right, self.manager)
+        self.right_card.grid(row=0, column=1, sticky="new", padx=(8, 0))
 
-        def check(parent, text, var, command):
-            return tk.Checkbutton(
-                parent,
-                text=text,
-                variable=var,
-                command=command,
-                font=(FONT, 9),
-                fg=TEXT,
-                bg=SURFACE_2,
-                selectcolor=SURFACE,
-                activebackground=SURFACE_2,
-                activeforeground=TEXT,
-                highlightthickness=0,
-            )
+    def _switch_row(self, parent, text, var, command):
+        row = tk.Frame(parent, bg=SURFACE)
+        row.pack(fill="x", pady=(8, 0))
+        M3Switch(row, var, command=command, bg=SURFACE).pack(side="left")
+        tk.Label(row, text=text, font=(FONT, 10), fg=TEXT, bg=SURFACE).pack(side="left", padx=(12, 0))
+        return row
 
-        def dropdown(parent, var, choices, command=None):
-            menu = tk.OptionMenu(parent, var, *choices, command=command or (lambda _value: None))
-            menu.config(
-                font=(FONT, 8),
-                bg=SURFACE,
-                fg=TEXT,
-                activebackground=BORDER,
-                activeforeground=TEXT,
-                highlightthickness=0,
-                relief="flat",
-                bd=0,
-            )
-            menu["menu"].config(font=(FONT, 8), bg=SURFACE, fg=TEXT, activebackground=ACCENT, activeforeground="#FFFFFF")
-            return menu
-
-        mouse = section("MOUSE")
-        self.mouse_var = tk.BooleanVar(value=False)
-        check(mouse, "Use the Joy-Con as a mouse", self.mouse_var, self._toggle_options).pack(anchor="w", pady=(6, 0))
-        tk.Label(mouse, text="ZR = left click   R = right click", font=(FONT, 8), fg=MUTED, bg=SURFACE_2).pack(
-            anchor="w"
-        )
-        speed_row = tk.Frame(mouse, bg=SURFACE_2)
-        speed_row.pack(anchor="w", pady=(8, 0))
-        tk.Label(speed_row, text="Speed", font=(FONT, 9), fg=TEXT, bg=SURFACE_2).pack(side="left")
-        self.speed_scale = tk.Scale(
-            speed_row,
-            from_=0.05,
-            to=1.5,
-            resolution=0.05,
-            orient="horizontal",
-            length=150,
-            showvalue=True,
-            command=self._set_speed,
-            bg=SURFACE_2,
-            fg=TEXT,
-            troughcolor=SURFACE,
-            activebackground=ACCENT,
-            highlightthickness=0,
-            bd=0,
-        )
-        self.speed_scale.set(0.3)
-        self.speed_scale.pack(side="left", padx=(8, 0))
-        self.mouse_raw_lbl = tk.Label(mouse, text="raw  X 0  Y 0", font=(MONO, 8), fg=MUTED, bg=SURFACE_2)
-        self.mouse_raw_lbl.pack(anchor="w", pady=(6, 0))
-
-        sound = section("SOUND")
-        sample_row = tk.Frame(sound, bg=SURFACE_2)
-        sample_row.pack(anchor="w", pady=(6, 0))
-        tk.Label(sample_row, text="Rumble", width=6, anchor="w", font=(FONT, 9), fg=TEXT, bg=SURFACE_2).pack(
-            side="left"
-        )
-        self.sample_var = tk.StringVar(value=VIBRATION_SAMPLES[1][0])
-        dropdown(
-            sample_row, self.sample_var, [name for name, _ in VIBRATION_SAMPLES[1:]], self._set_sample
-        ).pack(side="left")
-        song_row = tk.Frame(sound, bg=SURFACE_2)
-        song_row.pack(anchor="w", pady=(6, 0))
-        tk.Label(song_row, text="Song", width=6, anchor="w", font=(FONT, 9), fg=TEXT, bg=SURFACE_2).pack(side="left")
-        self.song_var = tk.StringVar(value=SONGS[0][0])
-        dropdown(song_row, self.song_var, [name for name, _ in SONGS]).pack(side="left")
-        btn_row = tk.Frame(sound, bg=SURFACE_2)
-        btn_row.pack(anchor="w", pady=(10, 0))
-        make_button(
-            btn_row,
-            "Play song",
-            lambda: self.manager.play_song(self.song_var.get()),
-            style="primary",
-            size=8,
-            padx=12,
-            pady=4,
-        ).pack(side="left")
-        make_button(btn_row, "Stop", self.manager.stop_vibration, size=8, padx=12, pady=4).pack(
-            side="left", padx=(6, 0)
-        )
-
-        options = section("OPTIONS")
-        output_row = tk.Frame(options, bg=SURFACE_2)
-        output_row.pack(anchor="w", pady=(6, 0))
-        tk.Label(output_row, text="Output", width=6, anchor="w", font=(FONT, 9), fg=TEXT, bg=SURFACE_2).pack(
-            side="left"
-        )
-        self.output_var = tk.StringVar(value=OUTPUT_LABELS[self.manager.output])
-        dropdown(output_row, self.output_var, list(OUTPUT_LABELS.values()), self._set_output).pack(side="left")
-        self.sideways_var = tk.BooleanVar(value=False)
-        check(options, "1-Joy-Con sideways mode", self.sideways_var, self._toggle_options).pack(
-            anchor="w", pady=(6, 0)
-        )
-        self.gyro_aim_var = tk.BooleanVar(value=False)
-        check(options, "Gyro aims the right stick", self.gyro_aim_var, self._toggle_options).pack(anchor="w")
-        self.auto_scan_var = tk.BooleanVar(value=load_settings().get("auto_scan", True))
-        check(options, "Scan when the app opens", self.auto_scan_var, self._toggle_auto_scan).pack(anchor="w")
+    def _build_deck_page(self):
+        page = tk.Frame(self.page_area, bg=BG)
+        self.pages["deck"] = page
         bridge = load_settings()
         self.bridge_var = tk.BooleanVar(value=bool(bridge.get("bridge_on", False)))
-        check(options, "Send controller to a Deck (network bridge)", self.bridge_var, self._toggle_bridge).pack(
-            anchor="w", pady=(6, 0)
-        )
-        ip_row = tk.Frame(options, bg=SURFACE_2)
-        ip_row.pack(anchor="w")
-        tk.Label(ip_row, text="Deck IP", width=8, anchor="w", font=(FONT, 9), fg=TEXT, bg=SURFACE_2).pack(side="left")
         self.bridge_ip_var = tk.StringVar(value=bridge.get("bridge_ip", ""))
-        ip_entry = tk.Entry(
-            ip_row, textvariable=self.bridge_ip_var, width=16, font=(FONT, 9),
-            bg=SURFACE, fg=TEXT, insertbackground=TEXT, relief="flat",
-        )
-        ip_entry.pack(side="left")
-        ip_entry.bind("<Return>", lambda _e: self._toggle_bridge())
-        if self.bridge_var.get():
-            self.manager.start_bridge(self.bridge_ip_var.get().strip())
+        self.deck_code_var = tk.StringVar(value=bridge.get("deck_code", ""))
 
-    def _build_cards(self):
-        row = tk.Frame(self, bg=BG)
-        row.pack(fill="both", expand=True, padx=16, pady=(14, 10))
-        row.grid_columnconfigure(0, weight=1, uniform="cards")
-        row.grid_columnconfigure(1, weight=1, uniform="cards")
-        row.grid_rowconfigure(0, weight=1)
-        self.left_card = JoyConCard(row, "Left Joy-Con 2", self.manager.left)
-        self.left_card.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
-        self.right_card = JoyConCard(row, "Right Joy-Con 2", self.manager.right)
-        self.right_card.grid(row=0, column=1, sticky="nsew", padx=(8, 0))
+        card = Card(page, bg=BG, fill=SURFACE)
+        card.pack(fill="x", anchor="n")
+        b = card.body
+        tk.Label(b, text="Use this PC's Joy-Cons on a Steam Deck", font=(FONT, 14, "bold"),
+                 fg=TEXT, bg=SURFACE).pack(anchor="w")
+        tk.Label(
+            b,
+            text="The Joy-Cons stay on this PC. The Deck shows them to Steam as a controller, "
+                 "over an encrypted Wi-Fi link.",
+            font=(FONT, 10), fg=MUTED, bg=SURFACE, justify="left", wraplength=760,
+        ).pack(anchor="w", pady=(4, 10))
+        self._switch_row(b, "Connect to the Deck", self.bridge_var, self._toggle_bridge)
+        fields = tk.Frame(b, bg=SURFACE)
+        fields.pack(anchor="w", pady=(14, 0))
+        ip_field = M3Field(fields, "Deck IP address", self.bridge_ip_var,
+                           helper="Shown on the Deck in Joy-Con 2 Studio.", width=260, bg=SURFACE)
+        ip_field.pack(side="left", anchor="n")
+        code_field = M3Field(fields, "Pairing code", self.deck_code_var,
+                             helper="Six digits, under Pairing on the Deck. It changes after every disconnect.",
+                             width=260, bg=SURFACE)
+        code_field.pack(side="left", anchor="n", padx=(18, 0))
+        ip_field.entry.bind("<Return>", lambda _e: self._toggle_bridge())
+        code_field.entry.bind("<Return>", lambda _e: self._toggle_bridge())
+        buttons = tk.Frame(b, bg=SURFACE)
+        buttons.pack(anchor="w", pady=(18, 0))
+        M3Button(buttons, "Connect", self._connect_deck, style="filled", bg=SURFACE).pack(side="left")
+        M3Button(buttons, "Disconnect", self._disconnect_deck, style="outlined", bg=SURFACE).pack(
+            side="left", padx=8)
+        self.link_lbl = tk.Label(buttons, text="Deck: off", font=(FONT, 10), fg=MUTED, bg=SURFACE)
+        self.link_lbl.pack(side="left", padx=(12, 0))
+
+        steps = Card(page, bg=BG, fill=SURFACE)
+        steps.pack(fill="x", anchor="n", pady=(14, 0))
+        sb = steps.body
+        tk.Label(sb, text="How to connect", font=(FONT, 12, "bold"), fg=TEXT, bg=SURFACE).pack(anchor="w")
+        for line in (
+            "1. On the Deck, open Joy-Con 2 Studio from Quick Access and note the pairing code.",
+            "2. Enter the Deck's IP address and the pairing code above, then press Connect.",
+            "3. Steam on the Deck shows the controller. Disconnect from either side at any time.",
+            "4. The code changes after every disconnect, so read the new code before you connect again.",
+        ):
+            tk.Label(sb, text=line, font=(FONT, 10), fg=MUTED, bg=SURFACE, justify="left",
+                     wraplength=760).pack(anchor="w", pady=(6, 0))
+
+    def _build_settings_page(self):
+        page = tk.Frame(self.page_area, bg=BG)
+        self.pages["settings"] = page
+        cols = tk.Frame(page, bg=BG)
+        cols.pack(fill="both", expand=True)
+        cols.grid_columnconfigure(0, weight=1, uniform="cols")
+        cols.grid_columnconfigure(1, weight=1, uniform="cols")
+        left = tk.Frame(cols, bg=BG)
+        left.grid(row=0, column=0, sticky="new", padx=(0, 8))
+        right = tk.Frame(cols, bg=BG)
+        right.grid(row=0, column=1, sticky="new", padx=(8, 0))
+
+        # Left column: how the Joy-Cons behave
+        self.sideways_var = tk.BooleanVar(value=False)
+        self.gyro_aim_var = tk.BooleanVar(value=False)
+        self.mouse_var = tk.BooleanVar(value=False)
+        self.auto_scan_var = tk.BooleanVar(value=load_settings().get("auto_scan", True))
+        self.which_var = tk.StringVar(value="Auto")
+
+        options = Card(left, bg=BG, fill=SURFACE)
+        options.pack(fill="x")
+        ob = options.body
+        tk.Label(ob, text="Joy-Con options", font=(FONT, 12, "bold"), fg=TEXT, bg=SURFACE).pack(anchor="w")
+        tk.Label(ob, text="Which Joy-Con is used", font=(FONT, 9), fg=MUTED, bg=SURFACE).pack(
+            anchor="w", pady=(10, 0))
+        M3Segmented(ob, ["Auto", "Left", "Right"], self.which_var, command=self._set_which,
+                    width=300, bg=SURFACE).pack(anchor="w", pady=(4, 0))
+        tk.Label(ob, text="Auto follows whichever Joy-Con you pick up.", font=(FONT, 8), fg=MUTED,
+                 bg=SURFACE).pack(anchor="w", pady=(4, 0))
+        self._switch_row(ob, "Use a Joy-Con as a mouse", self.mouse_var, self._toggle_options)
+        tk.Label(ob, text="Right Joy-Con: ZR left click, R right click.\n"
+                          "Left Joy-Con: ZL left click, L right click.",
+                 font=(FONT, 8), fg=MUTED, bg=SURFACE, justify="left").pack(anchor="w", padx=(64, 0), pady=(2, 0))
+        self.auto_mode_var = tk.BooleanVar(value=load_settings().get("auto_mode", True))
+        self._switch_row(ob, "Switch between mouse and controller automatically", self.auto_mode_var,
+                         self._toggle_auto_mode)
+        tk.Label(ob, text="Slide a Joy-Con on a surface to use it as a mouse. Press its sticks or buttons "
+                          "to use it as a controller again.",
+                 font=(FONT, 8), fg=MUTED, bg=SURFACE, justify="left", wraplength=380).pack(
+            anchor="w", padx=(64, 0), pady=(2, 0))
+        speed = tk.Frame(ob, bg=SURFACE)
+        speed.pack(anchor="w", pady=(10, 0))
+        tk.Label(speed, text="Mouse speed", font=(FONT, 10), fg=TEXT, bg=SURFACE).pack(side="left")
+        self.speed_scale = M3Slider(speed, 0.05, 1.5, 0.3, command=self._set_speed, step=0.05,
+                                    width=180, bg=SURFACE)
+        self.speed_scale.pack(side="left", padx=(12, 0))
+        self.mouse_raw_lbl = tk.Label(ob, text="raw  X 0  Y 0", font=(MONO, 9), fg=MUTED, bg=SURFACE)
+        self.mouse_raw_lbl.pack(anchor="w", pady=(8, 0))
+        self._switch_row(ob, "Use one Joy-Con held sideways, on its own", self.sideways_var, self._toggle_options)
+        self._switch_row(ob, "Gyro aims the right stick", self.gyro_aim_var, self._toggle_options)
+
+        startup = Card(left, bg=BG, fill=SURFACE)
+        startup.pack(fill="x", pady=(14, 0))
+        tk.Label(startup.body, text="Startup", font=(FONT, 12, "bold"), fg=TEXT, bg=SURFACE).pack(anchor="w")
+        self._switch_row(startup.body, "Scan for Joy-Cons when the app opens", self.auto_scan_var,
+                         self._toggle_auto_scan)
+        tk.Label(startup.body, text="Hold SYNC on each Joy-Con, then open the app.",
+                 font=(FONT, 8), fg=MUTED, bg=SURFACE, justify="left", wraplength=300).pack(
+            anchor="w", padx=(64, 0), pady=(2, 0))
+
+        # Right column: output, sound and about
+        output = Card(right, bg=BG, fill=SURFACE)
+        output.pack(fill="x")
+        ob2 = output.body
+        tk.Label(ob2, text="Virtual controller output", font=(FONT, 12, "bold"), fg=TEXT,
+                 bg=SURFACE).pack(anchor="w")
+        tk.Label(ob2, text="DualShock 4 is what Steam sees. Xbox 360 suits games that expect it.",
+                 font=(FONT, 9), fg=MUTED, bg=SURFACE, justify="left", wraplength=400).pack(anchor="w", pady=(2, 10))
+        self.output_var = tk.StringVar(value=OUTPUT_LABELS[self.manager.output])
+        M3Segmented(ob2, list(OUTPUT_LABELS.values()), self.output_var, command=self._set_output,
+                    width=400, bg=SURFACE).pack(anchor="w")
+
+        sound = Card(right, bg=BG, fill=SURFACE)
+        sound.pack(fill="x", pady=(14, 0))
+        sb = sound.body
+        tk.Label(sb, text="Sound", font=(FONT, 12, "bold"), fg=TEXT, bg=SURFACE).pack(anchor="w")
+        self.sample_var = tk.StringVar(value=VIBRATION_SAMPLES[1][0])
+        tk.Label(sb, text="Rumble test", font=(FONT, 9), fg=MUTED, bg=SURFACE).pack(anchor="w", pady=(10, 0))
+        M3Menu(sb, [name for name, _ in VIBRATION_SAMPLES[1:]], self.sample_var, command=self._set_sample,
+               width=400, bg=SURFACE).pack(anchor="w", pady=(4, 0))
+        self.song_var = tk.StringVar(value=SONGS[0][0])
+        tk.Label(sb, text="Song", font=(FONT, 9), fg=MUTED, bg=SURFACE).pack(anchor="w", pady=(10, 0))
+        M3Menu(sb, [name for name, _ in SONGS], self.song_var, width=400, bg=SURFACE).pack(anchor="w", pady=(4, 0))
+        row = tk.Frame(sb, bg=SURFACE)
+        row.pack(anchor="w", pady=(14, 0))
+        M3Button(row, "Play song", lambda: self.manager.play_song(self.song_var.get()),
+                 style="filled", bg=SURFACE).pack(side="left")
+        M3Button(row, "Stop", self.manager.stop_vibration, style="tonal", bg=SURFACE).pack(side="left", padx=8)
+
+        about = Card(right, bg=BG, fill=SURFACE)
+        about.pack(fill="x", pady=(14, 0))
+        ab = about.body
+        tk.Label(ab, text="About", font=(FONT, 12, "bold"), fg=TEXT, bg=SURFACE).pack(anchor="w")
+        tk.Label(ab, text=f"Joy-Con 2 Studio {APP_VERSION}", font=(FONT, 10), fg=MUTED,
+                 bg=SURFACE).pack(anchor="w", pady=(2, 10))
+        self.update_btn = M3Button(ab, "Check for updates", lambda: self._start_update_check(manual=True),
+                                   style="outlined", bg=SURFACE)
+        self.update_btn.pack(anchor="w")
+        tk.Label(ab, text="Closing the window keeps the app running in the notification area. "
+                          "Right-click its icon to quit.",
+                 font=(FONT, 8), fg=MUTED, bg=SURFACE, justify="left", wraplength=380).pack(anchor="w", pady=(10, 0))
+        M3Button(ab, "Quit", self._quit, style="danger", bg=SURFACE).pack(anchor="w", pady=(8, 0))
+
+    # ---- actions --------------------------------------------------------------------
 
     def _toggle_options(self):
         self.manager.sideways_single = self.sideways_var.get()
         self.manager.gyro_aim_enabled = self.gyro_aim_var.get()
         self.manager.mouse_enabled = self.mouse_var.get()
+        if not self.manager.mouse_enabled:
+            self.manager.release_mouse()
+        self.manager.set_active_choice(self.manager.active_choice)  # re-checks which Joy-Con is in use
         self.manager._sync_virtual_gamepad()
+
+    def _toggle_auto_mode(self):
+        self.manager.set_auto_mode(self.auto_mode_var.get())
+        settings = load_settings()
+        settings["auto_mode"] = self.auto_mode_var.get()
+        save_settings(settings)
+
+    def _set_which(self, label):
+        self.manager.set_active_choice({"Auto": "auto", "Left": "L", "Right": "R"}[label])
 
     def _toggle_bridge(self):
         ip = self.bridge_ip_var.get().strip()
+        code = self.deck_code_var.get().strip()
         settings = load_settings()
         settings["bridge_on"] = self.bridge_var.get()
         settings["bridge_ip"] = ip
+        settings["deck_code"] = code  # the pairing code is a secret; keep this settings file private
         save_settings(settings)
         if not self.bridge_var.get():
             self.manager.stop_bridge()
-            self._set_status("Stopped sending the controller to the Deck.")
-        elif not ip:
-            self._set_status("Enter the Deck's IP address to start the bridge.")
+            self._set_status("Disconnected from the Deck. This PC's virtual controller is back.")
+        elif not ip or not code:
+            self.bridge_var.set(False)
+            self._set_status("Enter the Deck's address and its pairing code to connect.")
         else:
-            self.manager.start_bridge(ip)
-            self._set_status(f"Sending the controller to the Deck at {ip} on UDP port {BRIDGE_PORT}.")
+            problem = self.manager.start_bridge(ip, code)
+            if problem:
+                self.bridge_var.set(False)
+                settings["bridge_on"] = False
+                save_settings(settings)
+                self._set_status(problem)
+            else:
+                self._set_status(f"Connecting to the Deck at {ip} (encrypted)...")
+        self._refresh_virtual_pill()
+
+    def _connect_deck(self):
+        self.bridge_var.set(True)
+        self._toggle_bridge()
+
+    def _disconnect_deck(self):
+        self.bridge_var.set(False)
+        self._toggle_bridge()
+
+    def _show_link_state(self):
+        state = self.manager.link.state
+        if state != getattr(self, "_shown_link", None):
+            self._shown_link = state
+            labels = {
+                "off": "Deck: off",
+                "searching": "Deck: searching",
+                "connected": "Deck: connected (PC controls off)",
+            }
+            chips = {
+                "connected": (GOOD_CONTAINER, ON_GOOD_CONTAINER),
+                "searching": (WARN_CONTAINER, ON_WARN_CONTAINER),
+            }
+            text = labels.get(state, state)
+            self.link_lbl.config(text=text)
+            bg, fg = chips.get(state, (SECONDARY_CONTAINER, ON_SECONDARY_CONTAINER))
+            self.deck_chip.config(text=text.split(" (")[0], bg=bg, fg=fg)
+            self._refresh_virtual_pill()
 
     def _toggle_auto_scan(self):
         settings = load_settings()
@@ -1649,15 +2605,59 @@ class JoyCon2App(tk.Tk):
         self.manager.right.calibrate()
         self._set_status("Calibrated neutral stick centers and gyroscope zero bias.")
 
+    def _close_to_tray(self):
+        """The close button hides the window. The app keeps running, with its Joy-Cons still connected."""
+        self.withdraw()
+
+    def _show_window(self):
+        self.deiconify()
+        self.lift()
+        self.focus_force()
+
+    def _handle_events(self):
+        """Tray and second-copy requests, handled on the window's own thread."""
+        while True:
+            try:
+                event = self._events.get_nowait()
+            except queue.Empty:
+                return
+            if event == "show":
+                self._show_window()
+            elif event == "quit":
+                self._quit()
+                return
+
+    def _quit(self):
+        """Really quits: takes the tray icon away, lets go of the Deck link and the Joy-Cons, and closes."""
+        if self._quitting:
+            return
+        self._quitting = True
+        if getattr(self, "_tick_job", None) is not None:
+            self.after_cancel(self._tick_job)  # no refresh is left waiting for a window that is gone
+        if self._tray is not None:
+            self._tray.remove()
+        self.manager.stop_bridge()
+        self.manager.disconnect_all()
+        self.destroy()
+
     def _tick(self):
+        self._handle_events()
+        if self._quitting:
+            return
+        self._drain_status()
         self.left_card.refresh()
         self.right_card.refresh()
-        driver = self.manager.right if self.manager.right.connected else self.manager.left
+        driver = self.manager._state_for(self.manager.active_side) if self.manager.active_side else self.manager.right
         mx, my = driver.mouse_raw
         self.mouse_raw_lbl.config(text=f"raw  X {mx:6d}  Y {my:6d}")
-        self.after(33, self._tick)
+        self._show_link_state()
+        if getattr(self, "_tick_job", None) is not None:
+            self.after_cancel(self._tick_job)  # only one refresh is ever waiting
+        self._tick_job = self.after(33, self._tick)
 
 
 if __name__ == "__main__":
+    if ask_running_copy_to_show():
+        sys.exit(0)  # the copy that is already running shows its window instead
     app = JoyCon2App()
     app.mainloop()

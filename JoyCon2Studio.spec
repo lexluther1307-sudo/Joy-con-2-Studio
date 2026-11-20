@@ -10,7 +10,7 @@ datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 
 a = Analysis(
     ['joycon2_gui.py'],
-    pathex=[],
+    pathex=['decky/joycon2studio'],
     binaries=binaries,
     datas=datas,
     hiddenimports=hiddenimports,
