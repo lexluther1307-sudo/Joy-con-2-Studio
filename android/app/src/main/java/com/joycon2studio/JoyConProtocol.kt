@@ -18,6 +18,10 @@ object JoyConUuids {
 
     fun rumble(side: Side): UUID =
         UUID.fromString(if (side == Side.LEFT) Generated.RUMBLE_CHAR_UUID_L else Generated.RUMBLE_CHAR_UUID_R)
+
+    /** The second notify channel whose byte 1 holds the battery. */
+    fun battery(side: Side): UUID =
+        UUID.fromString(if (side == Side.LEFT) Generated.BATTERY_CHANNEL_UUID_L else Generated.BATTERY_CHANNEL_UUID_R)
 }
 
 /** Sides that get the setup sequence (the right one only, as on the PC). */

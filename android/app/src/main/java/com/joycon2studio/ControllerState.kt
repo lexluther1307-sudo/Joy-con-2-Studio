@@ -24,6 +24,10 @@ class JoyConState(val side: Side) {
     @Volatile var accelX = 0.0
     @Volatile var accelY = 0.0
     @Volatile var accelZ = 0.0
+    // The battery, from the battery channel: bars 0-8 (8 is full), the percent, and whether it is charging
+    @Volatile var batteryBars = 0
+    @Volatile var batteryPct = 0
+    @Volatile var charging = false
 
     /** Sets the stick centre and the gyro zero to the current readings, as joycon2_gui.py's calibrate does. */
     fun calibrate() {
@@ -46,6 +50,9 @@ class JoyConState(val side: Side) {
         accelX = 0.0
         accelY = 0.0
         accelZ = 0.0
+        batteryBars = 0
+        batteryPct = 0
+        charging = false
     }
 }
 
@@ -84,6 +91,20 @@ object JoyConInput {
     }
 
     private fun u(data: ByteArray, index: Int): Int = data[index].toInt() and 0xFF
+}
+
+/** The battery from byte 1 of a Joy-Con's battery channel, as joycon2_gui.py's _battery_sampler reads it. */
+object BatteryReading {
+    class Level(val bars: Int, val percent: Int, val charging: Boolean)
+
+    /** Bits 2-5 are the level (0-8, 8 is full) and bit 1 says it is charging. Null when the report is too short. */
+    fun parse(data: ByteArray): Level? {
+        if (data.size <= 1) return null
+        val power = data[1].toInt() and 0xFF
+        val bars = (power shr 2) and 0x0F
+        val percent = minOf(100, Math.rint(bars / 8.0 * 100).toInt())
+        return Level(bars, percent, (power and 0x02) != 0)
+    }
 }
 
 /** A 12-bit stick from three bytes, as joycon2_gui.py's decode_stick. */

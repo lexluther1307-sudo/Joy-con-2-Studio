@@ -899,6 +899,11 @@ class JoyCon2Manager:
 
     def start_bridge(self, ip: str, code: str) -> str:
         """Starts the link. Returns "" when it started, or the reason it did not."""
+        try:
+            PcLink.check(ip, code)  # a bad address or code is refused before a running link is touched
+        except ValueError as exc:
+            self.log(str(exc))
+            return str(exc)
         if self.link.state != "off":
             self.link.disconnect()
         try:
@@ -2132,7 +2137,7 @@ def install_vigembus_driver(log, progress) -> bool:
 
 # --- Update check: asks GitHub for the newest release ---------------------------
 
-APP_VERSION = "0.2.19"
+APP_VERSION = "0.2.20"
 UPDATE_API = "https://api.github.com/repos/lexluther1307-sudo/Joy-con-2-Studio/releases/latest"
 RELEASES_PAGE = "https://github.com/lexluther1307-sudo/Joy-con-2-Studio/releases/latest"
 
@@ -3116,6 +3121,8 @@ class JoyCon2App(tk.Tk):
             self.manager.stop_bridge()
             self._set_status("Disconnected from the Deck. This PC's virtual controller is back.")
         elif not ip or not code:
+            if self.manager.link.state != "off":
+                self.manager.stop_bridge()  # the switch shows off, so the link must stop too
             self.bridge_var.set(False)
             self._set_status("Enter the Deck's address and its pairing code to connect.")
         else:
@@ -3126,7 +3133,7 @@ class JoyCon2App(tk.Tk):
                 save_settings(settings)
                 self._set_status(problem)
             else:
-                self._set_status(f"Connecting to the Deck at {ip} (encrypted)...")
+                self._set_status(f"Connecting to the Deck at {self.manager.link.deck_ip} (encrypted)...")
         self._refresh_virtual_pill()
 
     def _connect_deck(self):

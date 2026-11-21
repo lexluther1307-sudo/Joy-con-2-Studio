@@ -4,7 +4,7 @@ Use Nintendo Switch 2 Joy-Con 2 controllers on Windows, on Linux (Arch and Ubunt
 
 The Windows app connects the Joy-Cons over Bluetooth LE and presents them to Windows and Steam as a virtual DualShock 4: sticks, buttons, gyro, accelerometer and rumble. The Linux app does the same through `/dev/uhid`, and can use a Joy-Con as a mouse through `/dev/uinput`. The Steam Deck plugin (Decky Loader) can take the controllers from the PC over the network, so the Joy-Cons can stay on the PC.
 
-> **Experimental and unofficial.** Tested on Windows 11 with a left and a right Joy-Con 2. The Linux app has not been tested on Linux hardware yet, and the Android app has not been run on a phone yet. The Steam Deck plugin uses Wi-Fi only; it does not pair over Bluetooth. The network bridge to the Deck is new and has not been tested end to end with Steam.
+> **Experimental and unofficial.** Tested on Windows 11 with a left and a right Joy-Con 2. The Linux app has not been tested on Linux hardware yet, and the Android app's 0.1.1 changes (battery, reconnect and in-app update) have not been tried on a phone yet. The Steam Deck plugin uses Wi-Fi only; it does not pair over Bluetooth. The network bridge to the Deck is new and has not been tested end to end with Steam.
 
 ## Download
 
@@ -19,7 +19,7 @@ Before you run it:
 
 For Arch Linux and Ubuntu, build the packages from this repository. See [Linux app (Arch and Ubuntu)](#linux-app-arch-and-ubuntu).
 
-For Android, download the debug APK from the [v0.2.19 release](https://github.com/lexluther1307-sudo/Joy-con-2-Studio/releases/tag/v0.2.19), or build it from this repository. See [Android app](#android-app).
+For Android, download the debug APK from the [v0.2.20 release](https://github.com/lexluther1307-sudo/Joy-con-2-Studio/releases/tag/v0.2.20), or build it from this repository. See [Android app](#android-app).
 
 ## Features
 
@@ -38,6 +38,7 @@ Linux app (`joycon2_gui.py` with `uhid_pad.py` and `linux_mouse.py`):
 Android app (`android/`):
 - Connects Joy-Con 2 L and R over Bluetooth LE and shows their connection state, sticks and pressed buttons.
 - Sends the controller state to a Steam Deck over the same encrypted link, and passes the Deck's rumble to the Joy-Cons. Zero sticks and gyro works as on the PC.
+- Shows each Joy-Con's battery level. Checks GitHub for a newer Android build when it starts, and installs it from the app.
 
 Steam Deck plugin (`decky/joycon2studio`):
 - Receives controller state from the PC over an encrypted Wi-Fi link and presents it to Steam as a virtual DualShock 4 through `/dev/uhid`.
@@ -126,9 +127,11 @@ Build the APK on Windows, from the `android` folder:
 gradlew.bat :app:assembleDebug
 ```
 
-This needs JDK 17 and the Android SDK for platform 34. Android Studio sets up both and writes `android/local.properties`, which is not committed. The APK is written to `android\app\build\outputs\apk\debug\app-debug.apk`. The version 0.1.0 debug build is in the [v0.2.19 release](https://github.com/lexluther1307-sudo/Joy-con-2-Studio/releases/tag/v0.2.19) as `joycon2studio-android-0.1.0-debug.apk`, with SHA-256 `c6844681ae0e1065c533b81022f1d561f9ce9740f595052a34592dbc6d1105a0`.
+This needs JDK 17 and the Android SDK for platform 34. Android Studio sets up both and writes `android/local.properties`, which is not committed. The APK is written to `android\app\build\outputs\apk\debug\app-debug.apk`. The version 0.1.1 debug build is in the [v0.2.20 release](https://github.com/lexluther1307-sudo/Joy-con-2-Studio/releases/tag/v0.2.20) as `joycon2studio-android-0.1.1-debug.apk`, with SHA-256 `79ace765f02e922d36c1b4c7c3ae19e392a9e948c37e4db61cb7594228855362`.
 
 To install it, copy the APK to the phone and open it. When Android asks, allow installs from the app you opened it with, then tap Install. The app needs Android 8.0 or newer.
+
+The app checks GitHub for a newer build when it starts. If there is one, tap **Install update** on the app's screen. The download is checked against the release's checksum file, and Android asks you to confirm the install. Install version 0.1.1 once by hand, as above; later updates come from the app. Android installs an update only when it is signed with the same key as the copy on the phone, so in-app updates work between builds made on the same computer.
 
 To use it:
 
@@ -172,8 +175,8 @@ The link uses UDP port 26761. Pairing uses SPAKE2, so a recorded handshake canno
 - The Deck plugin runs as root, which `/dev/uhid` requires.
 - The Linux app is not tested on Linux hardware yet. Its virtual controller and mouse were written from the Windows app and the Deck plugin, and are checked only by unit tests.
 - The Linux app has no tray icon; closing its window keeps it running in the background.
-- The Android app has not been run on a phone or with Joy-Cons. Its protocol and controller data are checked against the desktop code by unit tests only.
-- The Android app has no mouse mode, rumble test, songs or battery readout. Its APK is a debug build, not on the Play Store.
+- The Android app's 0.1.1 changes (battery, reconnect and in-app update) are checked by unit tests and by reading the code only. The 0.1.0 app was tried on a phone with Joy-Cons and a Deck.
+- The Android app has no mouse mode, rumble test or songs. Its APK is a debug build, not on the Play Store.
 - Automatic updates for the Deck need a published GitHub release with `joycon2studio-plugin-<version>.zip` and `SHA256SUMS.txt`. The checksum guards against a damaged download, not against a release that someone changed.
 - The encryption has not been audited. Each connection uses fresh keys, so a leaked pairing code does not expose recorded past traffic. The code also changes after every disconnect; press New pairing code on the Deck to change it sooner.
 - The Joy-Con 2 protocol was worked out by reverse engineering, so a firmware update may break it.

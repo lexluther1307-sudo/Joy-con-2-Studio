@@ -7,6 +7,7 @@ import android.content.pm.PackageManager
 import android.location.LocationManager
 import android.os.Build
 import android.os.Bundle
+import android.view.View
 import android.view.WindowManager
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
@@ -51,12 +52,14 @@ class MainActivity : AppCompatActivity(), LinkModel.Screen {
         // The links belong to the ViewModel, so a recreated screen keeps the session
         model = ViewModelProvider(this)[LinkModel::class.java]
         model.screen = this
+        model.checkForUpdate()
 
         binding.scanButton.setOnClickListener { scanWithPermission() }
         binding.stopJoyConsButton.setOnClickListener { joyCons.disconnectAll() }
         binding.zeroButton.setOnClickListener { zeroJoyCons() }
         binding.deckConnectButton.setOnClickListener { connectDeck() }
         binding.deckDisconnectButton.setOnClickListener { link.disconnect() }
+        binding.updateButton.setOnClickListener { model.installUpdate() }
         render()
     }
 
@@ -94,6 +97,9 @@ class MainActivity : AppCompatActivity(), LinkModel.Screen {
         }
         binding.deckConnectButton.isEnabled = state == LinkClient.State.OFF
         binding.deckDisconnectButton.isEnabled = state != LinkClient.State.OFF
+        binding.updateText.text = model.updateText
+        binding.updateButton.isEnabled = !model.updateBusy
+        binding.updateButton.visibility = if (model.updateFound != null) View.VISIBLE else View.GONE
         refreshLive()
     }
 
@@ -174,8 +180,12 @@ class MainActivity : AppCompatActivity(), LinkModel.Screen {
         binding.liveText.text = lines.joinToString("\n")
     }
 
-    private fun statusLine(state: JoyConState): String =
-        "${state.side.label} Joy-Con: " + if (state.connected) "connected" else "not connected"
+    private fun statusLine(state: JoyConState): String {
+        val base = "${state.side.label} Joy-Con: " + if (state.connected) "connected" else "not connected"
+        if (!state.connected) return base
+        if (state.batteryBars == 0) return "$base, battery reading..."
+        return "$base, battery ${state.batteryPct}%" + if (state.charging) " (charging)" else ""
+    }
 
     private fun liveLine(state: JoyConState): String {
         val pressed = pressedNames(state.buttons).ifEmpty { listOf("none") }.joinToString(" ")

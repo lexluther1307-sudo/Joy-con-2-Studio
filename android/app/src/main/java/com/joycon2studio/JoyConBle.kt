@@ -17,6 +17,7 @@ import android.bluetooth.le.ScanSettings
 import android.content.Context
 import android.os.Build
 import android.os.SystemClock
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -119,6 +120,8 @@ class JoyConBle(context: Context, private val listener: Listener) {
         stopScan()
         for (conn in connections.values.toList()) {
             conn.job?.cancel()
+            conn.watchdog?.cancel()
+            conn.batteryJob?.cancel()
             conn.gatt?.disconnect()
         }
         connections.clear()
@@ -133,6 +136,9 @@ class JoyConBle(context: Context, private val listener: Listener) {
         stopScan()
         for (conn in connections.values.toList()) {
             conn.job?.cancel()
+            conn.watchdog?.cancel()
+            conn.batteryJob?.cancel()
+            conn.gatt?.disconnect()
             conn.gatt?.close()
         }
         connections.clear()
@@ -193,6 +199,15 @@ class JoyConBle(context: Context, private val listener: Listener) {
             return
         }
         conn.gatt = gatt
+        conn.watchdog = scope.launch {
+            delay(LINK_WAIT_MILLIS)
+            if (!conn.linked && connections[side] === conn) {
+                conn.gatt?.close()
+                conn.gatt = null
+                connections.remove(side)
+                listener.onStatus("The ${side.label} Joy-Con 2 did not answer. Try again.")
+            }
+        }
     }
 
     /** One Joy-Con's Bluetooth connection, with the lock that keeps its requests in order. */
@@ -202,14 +217,27 @@ class JoyConBle(context: Context, private val listener: Listener) {
         var pending: CompletableDeferred<Int>? = null
         var job: Job? = null
         @Volatile var ready = false
+        // Set when the GATT link comes up. The watchdog gives up on a Joy-Con whose link never does.
+        var linked = false
+        var watchdog: Job? = null
+        // The battery notifications of the current look, and the job that takes the looks (main thread only)
+        val batterySamples = ArrayList<ByteArray>()
+        var batteryJob: Job? = null
     }
 
     private inner class GattCallbacks(private val conn: Connection) : BluetoothGattCallback() {
         override fun onConnectionStateChange(gatt: BluetoothGatt, status: Int, newState: Int) {
             scope.launch {
                 if (status == BluetoothGatt.GATT_SUCCESS && newState == BluetoothProfile.STATE_CONNECTED) {
+                    conn.linked = true
+                    conn.watchdog?.cancel()
                     // a connection that disconnectAll() already removed is not set up; its disconnect still closes it
-                    if (connections[conn.side] === conn) conn.job = scope.launch { setUp(conn) }
+                    if (connections[conn.side] === conn) {
+                        // a second connect for the same side replaces the first setup and its battery look
+                        conn.job?.cancel()
+                        conn.batteryJob?.cancel()
+                        conn.job = scope.launch { setUp(conn) }
+                    }
                 } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
                     dropped(conn)
                 }
@@ -249,6 +277,10 @@ class JoyConBle(context: Context, private val listener: Listener) {
     }
 
     private fun input(conn: Connection, uuid: UUID, data: ByteArray) {
+        if (uuid == JoyConUuids.battery(conn.side)) {
+            scope.launch { conn.batterySamples.add(data) }
+            return
+        }
         if (uuid != JoyConUuids.INPUT_REPORT) return
         scope.launch { JoyConInput.apply(stateFor(conn.side), data) }
     }
@@ -293,6 +325,7 @@ class JoyConBle(context: Context, private val listener: Listener) {
         }
         stateFor(side).connected = true
         conn.ready = true
+        conn.batteryJob = scope.launch { batterySampler(conn) }
         listener.onStatus("Connected the ${side.label} Joy-Con 2.")
         if (left.connected && right.connected) stopScan() // both found: the scanner can stop
         listener.onChanged()
@@ -306,6 +339,8 @@ class JoyConBle(context: Context, private val listener: Listener) {
     private fun dropped(conn: Connection) {
         // Cancel first: completing the pending request would otherwise let the setup run on before it is cancelled
         conn.job?.cancel()
+        conn.watchdog?.cancel()
+        conn.batteryJob?.cancel()
         conn.pending?.complete(-1)
         conn.gatt?.close()
         conn.gatt = null
@@ -338,6 +373,44 @@ class JoyConBle(context: Context, private val listener: Listener) {
             wasActive = active
             delay(50)
         }
+    }
+
+    /** Reads the battery as joycon2_gui.py's _battery_sampler does: a short look at the battery channel, then a rest. */
+    private suspend fun batterySampler(conn: Connection) {
+        val channel = JoyConUuids.battery(conn.side)
+        while (conn.ready && connections[conn.side] === conn) {
+            conn.batterySamples.clear()
+            try {
+                if (conn.enableNotify(channel)) {
+                    delay(Generated.BATTERY_SAMPLE_MILLIS)
+                    conn.disableNotify(channel)
+                    val level = conn.batterySamples.lastOrNull()?.let { BatteryReading.parse(it) }
+                    if (level != null) {
+                        stateFor(conn.side).apply {
+                            batteryBars = level.bars
+                            batteryPct = level.percent
+                            charging = level.charging
+                        }
+                        listener.onChanged()
+                    }
+                }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                // as the desktop sampler does: a refused look is skipped, and the next look tries again
+            }
+            delay(Generated.BATTERY_EVERY_MILLIS)
+        }
+    }
+
+    /** Stops the notifications on one characteristic: the counterpart of enableNotify. */
+    @SuppressLint("MissingPermission")
+    private suspend fun Connection.disableNotify(uuid: UUID) {
+        val g = gatt ?: return
+        val ch = findCharacteristic(g, uuid) ?: return
+        g.setCharacteristicNotification(ch, false)
+        val config = ch.getDescriptor(JoyConUuids.CLIENT_CONFIG) ?: return
+        request { it.writeDescriptorCompat(config, BluetoothGattDescriptor.DISABLE_NOTIFICATION_VALUE) }
     }
 
     /** Runs one Bluetooth request and waits for its answer. Returns the GATT status, or -1 if it did not finish. */
@@ -378,6 +451,7 @@ class JoyConBle(context: Context, private val listener: Listener) {
     private companion object {
         const val SCAN_SECONDS = 12
         const val REQUEST_MILLIS = 5_000L
+        const val LINK_WAIT_MILLIS = 15_000L
     }
 }
 
@@ -396,13 +470,15 @@ private fun BluetoothGatt.writeCharacteristicCompat(ch: BluetoothGattCharacteris
 }
 
 @SuppressLint("MissingPermission")
-private fun BluetoothGatt.writeDescriptorCompat(descriptor: BluetoothGattDescriptor): Boolean {
+private fun BluetoothGatt.writeDescriptorCompat(
+    descriptor: BluetoothGattDescriptor,
+    value: ByteArray = BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE,
+): Boolean {
     if (Build.VERSION.SDK_INT >= 33) {
-        return writeDescriptor(descriptor, BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE) ==
-            BluetoothStatusCodes.SUCCESS
+        return writeDescriptor(descriptor, value) == BluetoothStatusCodes.SUCCESS
     }
     @Suppress("DEPRECATION")
-    descriptor.value = BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
+    descriptor.value = value
     @Suppress("DEPRECATION")
     return writeDescriptor(descriptor)
 }

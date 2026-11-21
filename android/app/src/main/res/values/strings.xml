@@ -12,4 +12,6 @@
     <string name="deck_code_hint">Pairing code (six digits)</string>
     <string name="deck_connect">Connect</string>
     <string name="deck_disconnect">Disconnect</string>
+    <string name="update_title">App updates</string>
+    <string name="update_install">Install update</string>
 </resources>

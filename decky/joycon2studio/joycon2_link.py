@@ -185,6 +185,22 @@ def pin_scalar(pin: str) -> int:
     return int.from_bytes(hashlib.sha512(b"joycon2studio pin" + pin.encode("ascii")).digest(), "little") % L
 
 
+def normalize_ipv4(text: str) -> str:
+    """The Deck's address as a plain dotted IPv4 address, for example 192.168.1.20, or ValueError.
+
+    An octet with leading zeros is read as decimal (192.168.001.020 is 192.168.1.20). The network stack can
+    read such an octet as octal, so the address is rewritten before it is used.
+    """
+    message = "Enter the Deck's address as four numbers from 0 to 255, for example 192.168.1.20."
+    parts = text.strip(" ").split(".")
+    if len(parts) != 4 or not all(part and len(part) <= 3 and all("0" <= c <= "9" for c in part) for part in parts):
+        raise ValueError(message)
+    numbers = [int(part) for part in parts]
+    if any(number > 255 for number in numbers):
+        raise ValueError(message)
+    return ".".join(str(number) for number in numbers)
+
+
 # ---- packets after the handshake ---------------------------------------------------------
 
 class Packet(NamedTuple):
@@ -302,10 +318,18 @@ class PcLink:
         self._lock = threading.Lock()
         self._mismatch_told = False
 
+    @staticmethod
+    def check(deck_ip: str, pin_text: str):
+        """Raises ValueError when the address or the pairing code cannot be used. Changes nothing."""
+        normalize_pin(pin_text)
+        normalize_ipv4(deck_ip)
+
     def configure(self, deck_ip: str, pin_text: str):
-        self.pin = normalize_pin(pin_text)
-        self.w = pin_scalar(self.pin)
-        self.deck_ip = deck_ip.strip()
+        pin = normalize_pin(pin_text)
+        address = normalize_ipv4(deck_ip)
+        self.pin = pin
+        self.w = pin_scalar(pin)
+        self.deck_ip = address  # canonical, so it matches the source address the socket reports
 
     def start(self):
         if self.pin is None or not self.deck_ip:
