@@ -19,7 +19,7 @@ Before you run it:
 
 For Arch Linux and Ubuntu, build the packages from this repository. See [Linux app (Arch and Ubuntu)](#linux-app-arch-and-ubuntu).
 
-For Android, build the APK from this repository. See [Android app](#android-app).
+For Android, download the debug APK from [`android/apk/`](android/apk/joycon2studio-android-0.1.0-debug.apk), or build it from this repository. See [Android app](#android-app).
 
 ## Features
 
@@ -126,7 +126,7 @@ Build the APK on Windows, from the `android` folder:
 gradlew.bat :app:assembleDebug
 ```
 
-This needs JDK 17 and the Android SDK for platform 34. Android Studio sets up both and writes `android/local.properties`, which is not committed. The APK is written to `android\app\build\outputs\apk\debug\app-debug.apk`.
+This needs JDK 17 and the Android SDK for platform 34. Android Studio sets up both and writes `android/local.properties`, which is not committed. The APK is written to `android\app\build\outputs\apk\debug\app-debug.apk`. The version 0.1.0 debug build is also in the repository at [`android/apk/joycon2studio-android-0.1.0-debug.apk`](android/apk/joycon2studio-android-0.1.0-debug.apk), with SHA-256 `c6844681ae0e1065c533b81022f1d561f9ce9740f595052a34592dbc6d1105a0`.
 
 To install it, copy the APK to the phone and open it. When Android asks, allow installs from the app you opened it with, then tap Install. The app needs Android 8.0 or newer.
 

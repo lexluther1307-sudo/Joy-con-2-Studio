@@ -28,3 +28,5 @@ node_modules/
 /android/app/build/
 /android/local.properties
 *.apk
+# The debug APK kept on purpose in android/apk
+!/android/apk/*.apk
