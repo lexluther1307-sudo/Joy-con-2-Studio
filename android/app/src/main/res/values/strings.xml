@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Joy-Con 2 Studio</string>
+    <string name="joycons_title">Joy-Cons</string>
+    <string name="joycons_help">Hold SYNC on each Joy-Con 2, then press Scan.</string>
+    <string name="scan">Scan for Joy-Cons</string>
+    <string name="disconnect_joycons">Disconnect Joy-Cons</string>
+    <string name="zero_sticks">Zero sticks and gyro</string>
+    <string name="deck_title">Steam Deck</string>
+    <string name="deck_help">On the Deck, open Joy-Con 2 Studio and note the address and the pairing code.</string>
+    <string name="deck_ip_hint">Deck IP address</string>
+    <string name="deck_code_hint">Pairing code (six digits)</string>
+    <string name="deck_connect">Connect</string>
+    <string name="deck_disconnect">Disconnect</string>
+</resources>

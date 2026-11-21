@@ -21,3 +21,10 @@ node_modules/
 
 # Packaged zips
 *.zip
+
+# Android build output, the local SDK path, and built APKs
+/android/.gradle/
+/android/build/
+/android/app/build/
+/android/local.properties
+*.apk
