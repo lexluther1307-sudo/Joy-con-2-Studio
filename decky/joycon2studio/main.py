@@ -32,7 +32,7 @@ from joycon2_link import NEUTRAL_REPORT, DeckLink, new_pin, normalize_pin  # noq
 from uhid_pad import UhidGamepad  # noqa: E402
 from updater import UpdateManager  # noqa: E402
 
-VERSION = "0.2.18"  # kept in sync by tools/build.py
+VERSION = "0.2.19"  # kept in sync by tools/build.py
 
 BRIDGE_PORT = 26761  # the Windows app connects to this UDP port
 SCAN_SECONDS = 5.0  # how long "Scan network" listens
