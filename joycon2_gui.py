@@ -6,6 +6,7 @@ import json
 import os
 import queue
 import re
+import shlex
 import shutil
 import socket
 import struct
@@ -2131,7 +2132,7 @@ def install_vigembus_driver(log, progress) -> bool:
 
 # --- Update check: asks GitHub for the newest release ---------------------------
 
-APP_VERSION = "0.2.17"
+APP_VERSION = "0.2.18"
 UPDATE_API = "https://api.github.com/repos/lexluther1307-sudo/Joy-con-2-Studio/releases/latest"
 RELEASES_PAGE = "https://github.com/lexluther1307-sudo/Joy-con-2-Studio/releases/latest"
 
@@ -2154,13 +2155,41 @@ def can_install_in_app() -> bool:
     return IS_WINDOWS and bool(getattr(sys, "frozen", False))
 
 
+def installed_from_deb() -> bool:
+    """True when this copy came from the Ubuntu/Debian package: it lives in /usr/lib/joycon2studio and dpkg has it."""
+    if not os.path.realpath(__file__).startswith("/usr/lib/joycon2studio/"):
+        return False
+    try:
+        status = subprocess.run(["dpkg-query", "-W", "-f=${Status}", "joycon2studio"],
+                                capture_output=True, text=True, timeout=10).stdout
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return "install ok installed" in status
+
+
+def can_install_linux_package() -> bool:
+    """The Linux install runs apt through pkexec, which shows the system's password prompt. It is offered only for
+    the app installed from the package. Other Linux copies keep the Get button."""
+    return IS_LINUX and shutil.which("pkexec") is not None and installed_from_deb()
+
+
+def installable_update(files: dict):
+    """'windows' or 'linux' when this copy can install the release by itself, otherwise None."""
+    if files.get("windows") and can_install_in_app():
+        return "windows"
+    if files.get("linux") and can_install_linux_package():
+        return "linux"
+    return None
+
+
 def current_exe() -> str:
     return os.path.abspath(sys.executable)
 
 
 def check_for_update() -> tuple:
-    """(a newer release exists, its tag, its page URL, (exe address, checksum address) or None).
-    Raises if GitHub cannot be reached."""
+    """(a newer release exists, its tag, its page URL, the files it offers by platform).
+    The files are {"windows": (exe address, checksum address) or None, "linux": (package address, checksum address)
+    or None}. Raises if GitHub cannot be reached."""
     req = urllib.request.Request(
         UPDATE_API,
         headers={"Accept": "application/vnd.github+json", "User-Agent": "Joy-Con-2-Studio"},
@@ -2170,7 +2199,8 @@ def check_for_update() -> tuple:
     latest = release.get("tag_name", "")
     latest_v = version_tuple(latest)
     newer = latest_v is not None and latest_v > version_tuple(APP_VERSION)
-    return newer, latest, release.get("html_url") or RELEASES_PAGE, update_assets(release)
+    files = {"windows": update_assets(release), "linux": linux_package_assets(release)}
+    return newer, latest, release.get("html_url") or RELEASES_PAGE, files
 
 
 def update_assets(release: dict):
@@ -2183,6 +2213,41 @@ def update_assets(release: dict):
     if not (exe.startswith(UPDATE_DOWNLOAD_PREFIX) and sums.startswith(UPDATE_DOWNLOAD_PREFIX)):
         return None
     return exe, sums
+
+
+def linux_package_assets(release: dict):
+    """(package address, checksum address) of a release's Ubuntu package, or None when it lacks either file.
+    Only addresses on the project's own GitHub release downloads are accepted."""
+    version = release.get("tag_name", "").lstrip("vV")
+    assets = {a.get("name"): a.get("browser_download_url", "") for a in release.get("assets", [])}
+    package, sums = assets.get(f"joycon2studio_{version}_all.deb", ""), assets.get(UPDATE_SUMS_NAME, "")
+    if not version or not package or not sums:
+        return None
+    if not (package.startswith(UPDATE_DOWNLOAD_PREFIX) and sums.startswith(UPDATE_DOWNLOAD_PREFIX)):
+        return None
+    return package, sums
+
+
+def linux_install_command(package: str) -> list:
+    """apt installs the downloaded package with its dependencies. pkexec shows the system's password prompt."""
+    return ["pkexec", "apt-get", "install", "-y", package]
+
+
+def linux_restart_script(pid: int, app: str, work_dir: str) -> str:
+    """A shell script that waits for this app to close (a minute at most, then it stops the app), removes the
+    download folder and starts the installed app."""
+    return "\n".join([
+        "#!/bin/sh",
+        "i=0",
+        f"while kill -0 {int(pid)} 2>/dev/null; do",
+        "    i=$((i + 1))",
+        f"    if [ $i -gt 120 ]; then kill {int(pid)} 2>/dev/null; sleep 1; break; fi",
+        "    sleep 0.5",
+        "done",
+        f"rm -rf {shlex.quote(work_dir)}",
+        f"exec {shlex.quote(app)}",
+        "",
+    ])
 
 
 def download_update(url: str, dest: str, progress=None) -> None:
@@ -2203,12 +2268,12 @@ def download_update(url: str, dest: str, progress=None) -> None:
                 progress(done / total)
 
 
-def verify_download(path: str, sums_text: str) -> bool:
-    """True when the file's SHA-256 is the one that SHA256SUMS.txt lists for JoyCon2Studio.exe."""
+def verify_download(path: str, sums_text: str, name: str = UPDATE_EXE_NAME) -> bool:
+    """True when the file's SHA-256 is the one that SHA256SUMS.txt lists for the file called name."""
     expected = None
     for line in sums_text.splitlines():
         parts = line.split()
-        if len(parts) == 2 and parts[1].lstrip("*") == UPDATE_EXE_NAME:
+        if len(parts) == 2 and parts[1].lstrip("*") == name:
             expected = parts[0].lower()
     if expected is None:
         return False
@@ -2594,7 +2659,7 @@ class JoyCon2App(tk.Tk):
 
         def worker():
             try:
-                newer, latest, url, assets = check_for_update()
+                newer, latest, url, files = check_for_update()
             except Exception as e:
                 if manual:
                     self._set_status(f"Could not check for updates: {e}")
@@ -2603,33 +2668,87 @@ class JoyCon2App(tk.Tk):
                 if manual:
                     self._set_status(f"You have the latest version ({APP_VERSION}).")
                 return
-            self.after(0, lambda: self._update_found(latest, url, assets))
-            # Installing by itself happens at startup, before the Joy-Cons are in use, and only if the setting asks
-            if not manual and assets and can_install_in_app() and load_settings().get("install_updates", False):
-                self.after(0, lambda: self._install_update(latest, assets))
+            self.after(0, lambda: self._update_found(latest, url, files))
+            # Installing by itself happens at startup, before the Joy-Cons are in use, and only if the setting asks.
+            # Windows only: the Linux install asks for a password, so it always waits for the Install button.
+            if not manual and installable_update(files) == "windows" and load_settings().get("install_updates", False):
+                self.after(0, lambda: self._install_update(latest, files))
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def _update_found(self, latest: str, url: str, assets):
-        if assets and can_install_in_app():
-            self.update_btn.config(text=f"Install {latest}",
-                                   command=lambda: self._confirm_install(latest, assets))
-            self._set_status(f"Version {latest} is available. Press Install {latest} to update the app.")
+    def _update_found(self, latest: str, url: str, files: dict):
+        kind = installable_update(files)
+        if kind:
+            self.update_btn.config(text=f"Install {latest}", command=lambda: self._confirm_install(latest, files))
+            hint = " It asks for your password." if kind == "linux" else ""
+            self._set_status(f"Version {latest} is available. Press Install {latest} to update the app.{hint}")
         else:
             self.update_btn.config(text=f"Get {latest}", command=lambda: webbrowser.open(url))
             self._set_status(f"Update available: {latest} (you have {APP_VERSION}). Use the Get {latest} button.")
 
-    def _confirm_install(self, latest: str, assets):
-        if messagebox.askyesno(
-            "Install update",
-            f"Install version {latest} now?\n\nThe app downloads it, checks the download, and restarts. "
-            "The Joy-Cons disconnect while it restarts, so press SYNC on them again once it is running.",
-            parent=self,
-        ):
-            self._install_update(latest, assets)
+    def _confirm_install(self, latest: str, files: dict):
+        if installable_update(files) == "linux":
+            text = (f"Install version {latest} now?\n\nThe app downloads the package and checks it. Then Ubuntu asks "
+                    "for your password to install it, and the app restarts. The Joy-Cons disconnect while it restarts, "
+                    "so press SYNC on them again once it is running.")
+        else:
+            text = (f"Install version {latest} now?\n\nThe app downloads it, checks the download, and restarts. "
+                    "The Joy-Cons disconnect while it restarts, so press SYNC on them again once it is running.")
+        if messagebox.askyesno("Install update", text, parent=self):
+            self._install_update(latest, files)
 
-    def _install_update(self, latest: str, assets):
-        exe_url, sums_url = assets
+    def _install_update(self, latest: str, files: dict):
+        kind = installable_update(files)
+        if kind == "linux":
+            self._install_package(latest, files["linux"])
+        elif kind == "windows":
+            self._install_exe(latest, files)
+
+    def _install_package(self, latest: str, assets: tuple):
+        package_url, sums_url = assets
+        self.update_btn.config(text="Installing...", command=lambda: None)
+        work_dir = tempfile.mkdtemp(prefix="joycon2studio-update-")
+        os.chmod(work_dir, 0o755)  # apt reads the package as its own user, so the folder must be readable
+        package_path = os.path.join(work_dir, f"joycon2studio_{latest.lstrip('vV')}_all.deb")
+
+        def back_to_install(message: str):
+            shutil.rmtree(work_dir, ignore_errors=True)
+            self.after(0, lambda: self.update_btn.config(
+                text=f"Install {latest}", command=lambda: self._confirm_install(latest, {"linux": assets})))
+            self._set_status(message)
+
+        def worker():
+            try:
+                self._set_status(f"Downloading version {latest}...")
+                download_update(package_url, package_path, progress=lambda f: self._set_status(
+                    f"Downloading version {latest}... {round(f * 100)}%"))
+                with urllib.request.urlopen(sums_url, timeout=30) as resp:
+                    sums = resp.read(64 * 1024).decode("utf-8", "replace")
+                if not verify_download(package_path, sums, os.path.basename(package_path)):
+                    raise RuntimeError("the download does not match SHA256SUMS.txt")
+                self._set_status(f"Installing version {latest}. Enter your password in the window that opens.")
+                result = subprocess.run(linux_install_command(package_path), stdin=subprocess.DEVNULL,
+                                        capture_output=True, text=True, errors="replace")
+                if result.returncode != 0:
+                    lines = (result.stderr or result.stdout).strip().splitlines()
+                    reason = lines[-1] if lines else f"exit code {result.returncode}"
+                    raise RuntimeError(f"apt did not install it ({reason})")
+                # The package is in place. A script waits for this app to close, then starts the installed version.
+                script = os.path.join(work_dir, "restart.sh")
+                with open(script, "w", encoding="utf-8", newline="\n") as handle:
+                    handle.write(linux_restart_script(os.getpid(), "/usr/bin/joycon2studio", work_dir))
+                subprocess.Popen(["/bin/sh", script], start_new_session=True, close_fds=True,
+                                 stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            except Exception as e:
+                back_to_install(f"Update to {latest} failed: {e}. The installed version was kept.")
+                return
+            self._set_status(f"Installed version {latest}. The app restarts now.")
+            self.after(0, self._quit)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _install_exe(self, latest: str, files: dict):
+        exe_url, sums_url = files["windows"]
         target = current_exe()
         folder = os.path.dirname(target)
         new_path = os.path.join(folder, "JoyCon2Studio.new.exe")
@@ -2661,7 +2780,7 @@ class JoyCon2App(tk.Tk):
                 except OSError:
                     pass
                 self.after(0, lambda: self.update_btn.config(
-                    text=f"Install {latest}", command=lambda: self._confirm_install(latest, assets)))
+                    text=f"Install {latest}", command=lambda: self._confirm_install(latest, files)))
                 self._set_status(f"Update to {latest} failed: {e}. The installed version was kept.")
                 return
             self._set_status(f"Installing version {latest}. The app restarts now.")

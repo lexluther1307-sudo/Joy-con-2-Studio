@@ -53,10 +53,10 @@ class AssetTests(unittest.TestCase):
         body = json.dumps(release("v0.2.14")).encode("utf-8")
         with mock.patch.object(g, "APP_VERSION", "0.2.13"), \
                 mock.patch.object(g.urllib.request, "urlopen", lambda req, timeout=None: FakeReply(body)):
-            newer, latest, url, assets = g.check_for_update()
+            newer, latest, url, files = g.check_for_update()
         self.assertTrue(newer)
         self.assertEqual(latest, "v0.2.14")
-        self.assertIsNotNone(assets)
+        self.assertIsNotNone(files["windows"])
 
     def test_the_same_version_is_not_newer(self):
         body = json.dumps(release("v0.2.14")).encode("utf-8")
@@ -139,6 +139,87 @@ class ChildEnvTests(unittest.TestCase):
         self.assertEqual(env["KEEP_ME"], "yes")
         self.assertFalse([key for key in env if key.upper().startswith(("_PYI", "_MEIPASS"))])
         self.assertEqual(env["PATH"], os.pathsep.join([r"C:\Windows", r"C:\Tools"]))
+
+
+def linux_release(version="v0.2.18", package=True, sums=True, base=PREFIX):
+    number = version.lstrip("vV")
+    assets = []
+    if package:
+        name = f"joycon2studio_{number}_all.deb"
+        assets.append({"name": name, "browser_download_url": f"{base}{version}/{name}"})
+    if sums:
+        assets.append({"name": "SHA256SUMS.txt", "browser_download_url": f"{base}{version}/SHA256SUMS.txt"})
+    return {"tag_name": version, "html_url": "https://example.com/page", "assets": assets}
+
+
+class LinuxInstallTests(unittest.TestCase):
+    def test_the_package_and_its_checksums_are_found(self):
+        package, sums = g.linux_package_assets(linux_release("v0.2.18"))
+        self.assertTrue(package.endswith("/joycon2studio_0.2.18_all.deb"))
+        self.assertTrue(sums.endswith("/SHA256SUMS.txt"))
+
+    def test_a_release_without_the_package_or_its_checksums_cannot_be_installed_on_linux(self):
+        self.assertIsNone(g.linux_package_assets(linux_release(package=False)))
+        self.assertIsNone(g.linux_package_assets(linux_release(sums=False)))
+
+    def test_package_addresses_from_elsewhere_are_refused(self):
+        self.assertIsNone(g.linux_package_assets(linux_release(base="https://example.com/")))
+
+    def test_check_for_update_offers_the_package_to_linux(self):
+        body = json.dumps(linux_release("v0.2.18")).encode("utf-8")
+        with mock.patch.object(g, "APP_VERSION", "0.2.17"), \
+                mock.patch.object(g.urllib.request, "urlopen", lambda req, timeout=None: FakeReply(body)):
+            newer, latest, _, files = g.check_for_update()
+        self.assertTrue(newer)
+        self.assertEqual(latest, "v0.2.18")
+        self.assertTrue(files["linux"][0].endswith("/joycon2studio_0.2.18_all.deb"))
+        self.assertIsNone(files["windows"])
+
+    def test_the_package_is_checked_against_its_own_line_in_the_checksum_file(self):
+        folder = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, folder, True)
+        name = "joycon2studio_0.2.18_all.deb"
+        path = os.path.join(folder, name)
+        with open(path, "wb") as handle:
+            handle.write(b"package bytes")
+        digest = hashlib.sha256(b"package bytes").hexdigest()
+        self.assertTrue(g.verify_download(path, f"{digest}  {name}\n", name))
+        self.assertFalse(g.verify_download(path, f"{digest}  JoyCon2Studio.exe\n", name))
+
+    def test_the_install_goes_through_apt_behind_a_system_password_prompt(self):
+        self.assertEqual(g.linux_install_command("/tmp/x/joycon2studio_0.2.18_all.deb"),
+                         ["pkexec", "apt-get", "install", "-y", "/tmp/x/joycon2studio_0.2.18_all.deb"])
+
+    def test_the_restart_script_waits_then_removes_the_download_then_starts_the_app(self):
+        text = g.linux_restart_script(4242, "/usr/bin/joycon2studio", "/tmp/joycon2studio-update-abc")
+        self.assertTrue(text.startswith("#!/bin/sh\n"))
+        self.assertLess(text.index("kill -0 4242"), text.index("rm -rf /tmp/joycon2studio-update-abc"))
+        self.assertLess(text.index("rm -rf"), text.index("exec /usr/bin/joycon2studio"))
+        self.assertTrue(text.endswith("exec /usr/bin/joycon2studio\n"))
+
+    def test_paths_with_spaces_are_quoted_in_the_restart_script(self):
+        text = g.linux_restart_script(1, "/usr/bin/joycon2studio", "/tmp/my folder")
+        self.assertIn("rm -rf '/tmp/my folder'", text)
+
+    def test_the_linux_install_is_offered_only_for_the_package_install(self):
+        with mock.patch.object(g, "IS_LINUX", True), mock.patch.object(g, "installed_from_deb", lambda: True), \
+                mock.patch.object(g.shutil, "which", lambda name: "/usr/bin/pkexec"):
+            self.assertTrue(g.can_install_linux_package())
+        with mock.patch.object(g, "IS_LINUX", True), mock.patch.object(g, "installed_from_deb", lambda: False), \
+                mock.patch.object(g.shutil, "which", lambda name: "/usr/bin/pkexec"):
+            self.assertFalse(g.can_install_linux_package())
+        with mock.patch.object(g, "IS_LINUX", False), mock.patch.object(g, "installed_from_deb", lambda: True):
+            self.assertFalse(g.can_install_linux_package())
+
+    def test_each_platform_installs_only_its_own_files(self):
+        both = {"windows": ("exe", "sums"), "linux": ("deb", "sums")}
+        with mock.patch.object(g, "can_install_in_app", lambda: True), \
+                mock.patch.object(g, "can_install_linux_package", lambda: False):
+            self.assertEqual(g.installable_update(both), "windows")
+            self.assertIsNone(g.installable_update({"windows": None, "linux": ("deb", "sums")}))
+        with mock.patch.object(g, "can_install_in_app", lambda: False), \
+                mock.patch.object(g, "can_install_linux_package", lambda: True):
+            self.assertEqual(g.installable_update(both), "linux")
 
 
 class GateTests(unittest.TestCase):
